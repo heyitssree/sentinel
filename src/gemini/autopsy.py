@@ -102,13 +102,16 @@ Focus on:
         winning = [t for t in trades if t.get('pnl', 0) > 0]
         losing = [t for t in trades if t.get('pnl', 0) <= 0]
         
+        avg_win = sum(t['pnl'] for t in winning) / len(winning) if winning else 0
+        avg_loss = sum(t['pnl'] for t in losing) / len(losing) if losing else 0
+        
         summary = f"""
 - Total Trades: {len(trades)}
 - Winning Trades: {len(winning)}
 - Losing Trades: {len(losing)}
 - Win Rate: {len(winning)/len(trades)*100:.1f}%
-- Average Win: ₹{sum(t['pnl'] for t in winning)/len(winning):.2f if winning else 0}
-- Average Loss: ₹{sum(t['pnl'] for t in losing)/len(losing):.2f if losing else 0}
+- Average Win: ₹{avg_win:.2f}
+- Average Loss: ₹{avg_loss:.2f}
 """
         return summary
     
@@ -653,7 +656,7 @@ class MockPostTradeAutopsy:
         logger.info("Mock post-trade autopsy initialized")
     
     def analyze(self, trades: List[Dict], tick_data: Dict = None,
-                date: datetime = None) -> AutopsyResult:
+                date: datetime = None, opportunity_cost_data: Dict = None) -> AutopsyResult:
         """Return mock autopsy result."""
         date = date or datetime.now()
         total_pnl = sum(t.get('pnl', 0) for t in trades) if trades else 0

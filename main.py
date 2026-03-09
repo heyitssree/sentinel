@@ -235,7 +235,7 @@ class Sentinel:
         candle = {
             'ticker': symbol,
             'timestamp': self._last_candle_time[symbol],
-            'open': prices[0],
+            'open_': prices[0],
             'high': max(prices),
             'low': min(prices),
             'close': prices[-1],
@@ -394,13 +394,21 @@ class Sentinel:
         results = []
         futures = {self._executor.submit(process_ticker, ticker): ticker for ticker in tickers}
         
-        for future in as_completed(futures, timeout=60):
-            ticker = futures[future]
-            try:
-                result = future.result(timeout=10)
-                results.append(result)
-            except Exception as e:
-                results.append((ticker, False, str(e)))
+        try:
+            for future in as_completed(futures, timeout=60):
+                ticker = futures[future]
+                try:
+                    result = future.result(timeout=10)
+                    results.append(result)
+                except Exception as e:
+                    results.append((ticker, False, str(e)))
+        except TimeoutError:
+            # Handle tickers that didn't complete within the overall timeout
+            for future, ticker in futures.items():
+                if not future.done():
+                    logger.warning(f"Analysis timeout for {ticker}")
+                    results.append((ticker, False, "Analysis timeout (>60s)"))
+                    future.cancel()
         
         return results
     
