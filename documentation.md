@@ -478,3 +478,122 @@ RISK_PER_TRADE=500              # ₹500 risk per trade
 
 ### Detailed Plan
 See `plan.md` for full audit findings and remaining items.
+
+---
+
+## Phase 4: Integration Fixes & Feature Additions (Mar 10, 2026)
+
+### Completed Changes
+
+| Phase | Component | File | Description |
+|-------|-----------|------|-------------|
+| **1.1** | Import Updates | `main.py` | Replaced `SignalEngine` with `ConfluentSignalEngine`, `SmartTrailingStop`, `RegimeDetector` |
+| **1.2** | Engine Init | `main.py` | Added `self.trailing_stop = SmartTrailingStop()` and `self.regime_detector` |
+| **1.3** | Analyze Ticker | `main.py` | Dynamic side detection, ATR-based stops via `calculate_dynamic_stops()`, position registration |
+| **1.4** | Trailing Stop | `main.py` | Smart trailing stop updates in heartbeat with 9-EMA tracking |
+| **2.1** | Regime Check | `main.py` | Integrated `RegimeDetector` at 9:20 AM + every 30 min, applies kill switch multiplier |
+| **2.2** | Async Prep | `main.py` | Added `_process_tickers_parallel()` and `_process_tickers_async()` for future WebSocket migration |
+| **3.1** | Heatmap API | `server.py` | Added `ema_200`, `ema_200_distance_pct`, `vwap`, `vwap_distance_pct`, `in_vwap_pullback_zone` |
+| **3.2** | Heatmap UI | `TechnicalHeatmap.jsx` | 200 EMA indicator dot, VWAP pullback zone highlight, updated legend |
+| **3.3** | AI Panel | `AIReasoningPanel.jsx` | Active trades accordion with entry reasoning, sentiment score, chart safety |
+| **3.4** | Mobile UI | `App.jsx` | Responsive header, navigation tabs, portfolio overview, grids |
+
+### New Signal Logic Integration
+
+**OLD (Deprecated SignalEngine):**
+```python
+should_audit, analysis = self.signal_engine.should_trigger_audit(candles)
+side = "BUY"  # Static
+stop_loss = self.signal_engine.get_stop_loss(entry_price, atr)
+```
+
+**NEW (ConfluentSignalEngine + SmartTrailingStop):**
+```python
+should_audit, analysis = self.signal_engine.should_trigger_audit(candles, ticker)
+side = "BUY" if analysis.signal_type.name == "LONG_ENTRY" else "SELL"  # Dynamic
+stop_loss, take_profit = self.signal_engine.calculate_dynamic_stops(entry_price, atr, side)
+self.trailing_stop.register_position(ticker, entry_price, entry_time, quantity, side, atr)
+```
+
+### Regime-Aware Risk Control
+
+- Uses existing `src/gemini/regime_detector.py` module
+- Checks at 9:20 AM IST and every 30 minutes
+- When CHOPPY regime detected: `apply_regime_multiplier(0.5, "CHOPPY")`
+- Resets to full limit when trending detected
+
+### Heatmap API Enhancement
+
+New fields in `/api/heatmap/nifty50` response:
+```json
+{
+  "ema_200": 2450.25,
+  "ema_200_distance_pct": 1.5,
+  "above_ema_200": true,
+  "vwap": 2480.00,
+  "vwap_distance_pct": 0.3,
+  "in_vwap_pullback_zone": true
+}
+```
+
+### Frontend Enhancements
+
+**TechnicalHeatmap.jsx:**
+- Green/red dot for 200 EMA status (above/below)
+- Cyan ring for VWAP pullback zone (within 0.5%)
+- Updated legend with EMA and VWAP indicators
+
+**AIReasoningPanel.jsx:**
+- Expandable accordion for active trades only
+- Shows: Entry reason, sentiment score, chart safety, entry details
+- Auto-refreshes every 30 seconds
+
+**App.jsx Mobile Responsiveness:**
+- Header stacks vertically on mobile
+- Navigation tabs horizontal scroll
+- Portfolio grid: 2-col mobile → 4-col desktop
+- Compact button sizes with icon-only on small screens
+
+---
+
+## Security & Stability Audit (Mar 10, 2026 - Session 2)
+
+### Issues Identified & Fixed
+
+| ID | Severity | Issue | File | Fix |
+|----|----------|-------|------|-----|
+| **H7** | Medium | SQL injection pattern in `get_database_stats` | `src/storage/db.py` | Added `VALID_TABLES` frozenset whitelist |
+| **M9** | Medium | Bare `except:` clause swallows errors | `src/ingestion/news_scraper.py` | Changed to `except (TypeError, ValueError)` with logging |
+| **M10** | Medium | Server binds to `0.0.0.0` by default | `src/api/server.py` | Default to `127.0.0.1`, allow env override |
+| **A1/H2** | High | AI response parsing lacks defensive checks | `src/gemini/vision.py` | Added fallbacks for all fields with `getattr()` |
+
+### Previously Fixed Issues (Verified)
+
+| ID | Issue | Status |
+|----|-------|--------|
+| **C1** | SSL verification disabled globally | ✅ Already using certifi |
+| **C2** | Division by zero in autopsy | ✅ Guard already in place |
+| **H4** | Race condition in news cache | ✅ Thread-safe with `_cache_lock` |
+| **H5** | Silent WebSocket errors | ✅ Logging and dead connection cleanup |
+| **M4** | CORS wildcard | ✅ Env-configurable with warning |
+| **M5** | No ticker validation | ✅ `validate_ticker()` with regex |
+| **M6** | Thread-unsafe DB singleton | ✅ Double-check locking pattern |
+| **A2** | No confidence threshold | ✅ `min_confidence=0.6` parameter |
+
+### Critical Alert: Exposed API Keys
+
+**File:** `.env` contains real credentials (Kite API, Gemini API)
+**Action Required:** 
+1. ✅ Verified `.env` is in `.gitignore`
+2. ⚠️ User should rotate all exposed keys immediately
+3. ⚠️ Check git history for committed secrets
+
+### Verification Results
+
+```
+✅ src/storage/db.py - Compiles successfully
+✅ src/ingestion/news_scraper.py - Compiles successfully  
+✅ src/api/server.py - Compiles successfully
+✅ src/gemini/vision.py - Compiles successfully
+✅ Core imports verified (db, news_scraper)
+```

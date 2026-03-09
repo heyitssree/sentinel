@@ -1037,12 +1037,36 @@ async def get_nifty50_heatmap():
             rsi_value = None
             volume_spike = False
             price = 0.0
+            ema_200_value = None
+            vwap_value = None
         else:
             rsi = engine.indicators.calculate_rsi(candles, 14)
             rsi_value = float(rsi.iloc[-1]) if not rsi.empty and len(rsi) > 0 else None
             volume_info = engine.indicators.get_volume_spike_info(candles)
             volume_spike = bool(volume_info['is_spike'])  # Convert numpy.bool to Python bool
             price = float(candles['close'].iloc[-1])
+            
+            # Calculate 200 EMA and VWAP for new heatmap indicators
+            ema_200 = engine.indicators.calculate_ema_200(candles)
+            ema_200_value = float(ema_200.iloc[-1]) if not ema_200.empty and len(ema_200) > 0 else None
+            
+            vwap = engine.indicators.calculate_vwap(candles)
+            vwap_value = float(vwap.iloc[-1]) if not vwap.empty and len(vwap) > 0 else None
+        
+        # Calculate distance percentages for heatmap coloring
+        ema_200_distance_pct = None
+        vwap_distance_pct = None
+        in_vwap_pullback_zone = False
+        above_ema_200 = None
+        
+        if price > 0 and ema_200_value and ema_200_value > 0:
+            ema_200_distance_pct = ((price - ema_200_value) / ema_200_value) * 100
+            above_ema_200 = price > ema_200_value
+        
+        if price > 0 and vwap_value and vwap_value > 0:
+            vwap_distance_pct = ((price - vwap_value) / vwap_value) * 100
+            # VWAP pullback zone: within 0.5% of VWAP (either side)
+            in_vwap_pullback_zone = abs(vwap_distance_pct) <= 0.5
         
         # Determine RSI status
         if rsi_value is None:
@@ -1066,7 +1090,14 @@ async def get_nifty50_heatmap():
             "rsi_status": rsi_status,
             "volume_spike": volume_spike,
             "in_watchlist": in_watchlist,
-            "weight": stock.weight
+            "weight": stock.weight,
+            # New fields for enhanced heatmap
+            "ema_200": ema_200_value,
+            "ema_200_distance_pct": ema_200_distance_pct,
+            "above_ema_200": above_ema_200,
+            "vwap": vwap_value,
+            "vwap_distance_pct": vwap_distance_pct,
+            "in_vwap_pullback_zone": in_vwap_pullback_zone
         }
         
         heatmap_data.append(stock_data)
@@ -1688,4 +1719,7 @@ if frontend_path.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Security: Default to localhost, allow override via environment for production
+    host = os.getenv("API_HOST", "127.0.0.1")
+    port = int(os.getenv("API_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)

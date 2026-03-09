@@ -17,10 +17,32 @@ const getRSIBorderColor = (rsiStatus) => {
   }
 };
 
+// Helper function for 200 EMA status color
+const getEMAColor = (aboveEma200) => {
+  if (aboveEma200 === null || aboveEma200 === undefined) return 'bg-slate-600';
+  return aboveEma200 ? 'bg-emerald-600' : 'bg-rose-600';
+};
+
+// Helper function for VWAP pullback zone indicator
+const getVWAPIndicator = (inPullbackZone, vwapDistancePct) => {
+  if (inPullbackZone) {
+    return { color: 'text-cyan-400', icon: '◉', tooltip: 'In VWAP Pullback Zone' };
+  }
+  if (vwapDistancePct !== null && vwapDistancePct !== undefined) {
+    if (vwapDistancePct > 0) {
+      return { color: 'text-green-400', icon: '↑', tooltip: `${vwapDistancePct.toFixed(1)}% above VWAP` };
+    } else {
+      return { color: 'text-red-400', icon: '↓', tooltip: `${Math.abs(vwapDistancePct).toFixed(1)}% below VWAP` };
+    }
+  }
+  return { color: 'text-slate-500', icon: '—', tooltip: 'No VWAP data' };
+};
+
 // Extracted StockCell component - memoized to prevent unnecessary re-renders
 const StockCell = memo(({ stock, activeTicker, onSelectTicker }) => {
   const isActive = stock.ticker === activeTicker;
   const isWatchlist = stock.in_watchlist;
+  const vwapIndicator = getVWAPIndicator(stock.in_vwap_pullback_zone, stock.vwap_distance_pct);
 
   return (
     <div
@@ -31,21 +53,36 @@ const StockCell = memo(({ stock, activeTicker, onSelectTicker }) => {
         ${isActive ? 'ring-2 ring-white scale-105' : ''}
         ${isWatchlist ? 'border-2' : 'border border-opacity-30'}
         ${stock.volume_spike ? 'animate-pulse' : ''}
+        ${stock.in_vwap_pullback_zone ? 'ring-1 ring-cyan-400' : ''}
         hover:scale-105 hover:z-10
       `}
-      title={`${stock.name}\nRSI: ${stock.rsi?.toFixed(1) || 'N/A'}\nPrice: ₹${stock.price?.toFixed(2) || 'N/A'}`}
+      title={`${stock.name}\nRSI: ${stock.rsi?.toFixed(1) || 'N/A'}\nPrice: ₹${stock.price?.toFixed(2) || 'N/A'}\n200 EMA: ${stock.above_ema_200 ? 'Above ↑' : 'Below ↓'} (${stock.ema_200_distance_pct?.toFixed(1) || 'N/A'}%)\nVWAP: ${vwapIndicator.tooltip}`}
     >
+      {/* VWAP Pullback Zone glow effect */}
+      {stock.in_vwap_pullback_zone && (
+        <div className="absolute inset-0 rounded-lg bg-cyan-400 opacity-20" />
+      )}
+      
       {/* Volume spike glow effect */}
       {stock.volume_spike && (
         <div className="absolute inset-0 rounded-lg bg-yellow-400 opacity-30 animate-ping" />
       )}
       
       <div className="relative z-10">
-        <div className="text-xs font-bold text-white truncate">
-          {stock.ticker}
+        <div className="flex items-center justify-between">
+          <div className="text-xs font-bold text-white truncate">
+            {stock.ticker}
+          </div>
+          {/* 200 EMA indicator - small dot */}
+          <div className={`w-1.5 h-1.5 rounded-full ${stock.above_ema_200 ? 'bg-emerald-400' : 'bg-rose-400'}`} 
+               title={stock.above_ema_200 ? 'Above 200 EMA' : 'Below 200 EMA'} />
         </div>
-        <div className="text-xs text-white/80">
-          {stock.rsi?.toFixed(0) || '—'}
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-white/80">{stock.rsi?.toFixed(0) || '—'}</span>
+          {/* VWAP indicator */}
+          <span className={`${vwapIndicator.color} text-[10px]`} title={vwapIndicator.tooltip}>
+            {vwapIndicator.icon}
+          </span>
         </div>
         
         {/* Watchlist indicator */}
@@ -194,7 +231,7 @@ const TechnicalHeatmap = ({ onSelectTicker, activeTicker }) => {
       </div>
 
       {/* Legend */}
-      <div className="flex items-center gap-4 mb-4 text-xs text-slate-400">
+      <div className="flex flex-wrap items-center gap-3 mb-4 text-xs text-slate-400">
         <div className="flex items-center gap-1">
           <div className="w-3 h-3 bg-green-500 rounded" />
           <span>RSI &gt; 60</span>
@@ -207,9 +244,21 @@ const TechnicalHeatmap = ({ onSelectTicker, activeTicker }) => {
           <div className="w-3 h-3 bg-slate-600 rounded" />
           <span>Neutral</span>
         </div>
+        <div className="flex items-center gap-1 border-l border-slate-600 pl-3">
+          <div className="w-2 h-2 bg-emerald-400 rounded-full" />
+          <span>&gt; 200 EMA</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <div className="w-2 h-2 bg-rose-400 rounded-full" />
+          <span>&lt; 200 EMA</span>
+        </div>
+        <div className="flex items-center gap-1 border-l border-slate-600 pl-3">
+          <span className="text-cyan-400">◉</span>
+          <span>VWAP Zone</span>
+        </div>
         <div className="flex items-center gap-1">
           <span>⚡</span>
-          <span>Volume Spike</span>
+          <span>Vol Spike</span>
         </div>
         <div className="flex items-center gap-1">
           <div className="w-2 h-2 bg-yellow-400 rounded-full" />

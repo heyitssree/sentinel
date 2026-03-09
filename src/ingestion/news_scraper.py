@@ -195,8 +195,8 @@ class NewsScraper:
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
                     try:
                         timestamp = datetime(*entry.published_parsed[:6])
-                    except:
-                        pass
+                    except (TypeError, ValueError) as e:
+                        logger.debug(f"Failed to parse timestamp for entry: {e}")
                 
                 # Create news item for each mentioned ticker
                 for ticker in tickers:

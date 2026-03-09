@@ -782,13 +782,17 @@ class SentinelDB:
         
         return results
     
+    # Whitelist of valid table names for SQL queries (security: prevent injection)
+    VALID_TABLES = frozenset(['ticks', 'candles', 'news', 'trades', 'positions'])
+    
     def get_database_stats(self) -> Dict[str, Any]:
         """Get database size and record counts for monitoring."""
         stats = {}
         
-        # Record counts per table
-        for table in ['ticks', 'candles', 'news', 'trades', 'positions']:
+        # Record counts per table (validated against whitelist)
+        for table in self.VALID_TABLES:
             try:
+                # Table name is validated against VALID_TABLES whitelist
                 result = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
                 stats[f'{table}_count'] = result[0] if result else 0
             except Exception:

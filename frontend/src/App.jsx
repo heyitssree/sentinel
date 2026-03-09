@@ -457,50 +457,50 @@ function App() {
         ))}
       </div>
 
-      {/* Header */}
-      <header className="flex items-center justify-between mb-8">
-        <div className="flex items-center gap-4">
-          <Shield className="w-10 h-10 text-blue-500" />
+      {/* Header - Mobile Responsive */}
+      <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 md:mb-8 gap-4">
+        <div className="flex items-center gap-3 md:gap-4">
+          <Shield className="w-8 h-8 md:w-10 md:h-10 text-blue-500" />
           <div>
-            <h1 className="text-2xl font-bold">The Sentinel</h1>
-            <p className="text-gray-400 text-sm">Multimodal Alpha Engine</p>
+            <h1 className="text-xl md:text-2xl font-bold">The Sentinel</h1>
+            <p className="text-gray-400 text-xs md:text-sm">Multimodal Alpha Engine</p>
           </div>
         </div>
         
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-2 md:gap-4 w-full sm:w-auto">
           {/* Connection Status */}
-          <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${wsConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+          <div className={`flex items-center gap-2 px-2 md:px-3 py-1 rounded-full text-xs md:text-sm ${wsConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
             <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-green-500 pulse-green' : 'bg-red-500 pulse-red'}`} />
-            <span className="text-sm">{wsConnected ? 'Connected' : 'Disconnected'}</span>
+            <span className="hidden xs:inline">{wsConnected ? 'Connected' : 'Disconnected'}</span>
           </div>
           
-          {/* Engine Controls */}
-          <div className="flex gap-2">
+          {/* Engine Controls - Compact on mobile */}
+          <div className="flex gap-1 md:gap-2 flex-wrap">
             <button 
               onClick={() => setShowSettings(true)}
-              className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+              className="flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition text-sm"
             >
               <Settings className="w-4 h-4" />
             </button>
             <button 
               onClick={() => controlEngine('start')}
               disabled={status?.running}
-              className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition"
+              className="flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition text-sm"
             >
-              <Play className="w-4 h-4" /> Start
+              <Play className="w-4 h-4" /> <span className="hidden md:inline">Start</span>
             </button>
             <button 
               onClick={() => controlEngine('stop')}
               disabled={!status?.running}
-              className="flex items-center gap-2 px-4 py-2 bg-gray-600 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition"
+              className="flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 bg-gray-600 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition text-sm"
             >
-              <Square className="w-4 h-4" /> Stop
+              <Square className="w-4 h-4" /> <span className="hidden md:inline">Stop</span>
             </button>
             <button 
               onClick={() => controlEngine('emergency_stop')}
-              className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg transition"
+              className="flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 bg-red-600 hover:bg-red-700 rounded-lg transition text-sm"
             >
-              <Zap className="w-4 h-4" /> Emergency
+              <Zap className="w-4 h-4" /> <span className="hidden lg:inline">Emergency</span>
             </button>
           </div>
         </div>
@@ -751,44 +751,48 @@ function App() {
         </div>
       )}
 
-      {/* View Navigation Tabs */}
-      <div className="flex items-center gap-2 mb-6 bg-slate-800/50 rounded-lg p-1 w-fit">
-        <button
-          onClick={() => setActiveView('dashboard')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${
-            activeView === 'dashboard' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
-          }`}
-        >
-          <LayoutGrid className="w-4 h-4" /> Dashboard
-        </button>
-        <button
-          onClick={() => setActiveView('heatmap')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${
-            activeView === 'heatmap' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
-          }`}
-        >
-          <Activity className="w-4 h-4" /> Heatmap
-        </button>
-        <button
-          onClick={() => setActiveView('chart')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${
-            activeView === 'chart' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
-          }`}
-        >
-          <CandlestickChart className="w-4 h-4" /> Chart
-        </button>
-        <button
-          onClick={() => setActiveView('autopsy')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${
-            activeView === 'autopsy' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
-          }`}
-        >
-          <FileText className="w-4 h-4" /> Daily Report
-        </button>
+      {/* View Navigation Tabs - Mobile responsive with horizontal scroll */}
+      <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-4 md:mb-6">
+        <div className="overflow-x-auto scrollbar-hide">
+          <div className="flex items-center gap-1 md:gap-2 bg-slate-800/50 rounded-lg p-1 min-w-max">
+            <button
+              onClick={() => setActiveView('dashboard')}
+              className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg transition text-xs md:text-sm whitespace-nowrap ${
+                activeView === 'dashboard' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
+              }`}
+            >
+              <LayoutGrid className="w-3 h-3 md:w-4 md:h-4" /> <span className="hidden sm:inline">Dashboard</span><span className="sm:hidden">Home</span>
+            </button>
+            <button
+              onClick={() => setActiveView('heatmap')}
+              className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg transition text-xs md:text-sm whitespace-nowrap ${
+                activeView === 'heatmap' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
+              }`}
+            >
+              <Activity className="w-3 h-3 md:w-4 md:h-4" /> Heatmap
+            </button>
+            <button
+              onClick={() => setActiveView('chart')}
+              className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg transition text-xs md:text-sm whitespace-nowrap ${
+                activeView === 'chart' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
+              }`}
+            >
+              <CandlestickChart className="w-3 h-3 md:w-4 md:h-4" /> Chart
+            </button>
+            <button
+              onClick={() => setActiveView('autopsy')}
+              className={`flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 rounded-lg transition text-xs md:text-sm whitespace-nowrap ${
+                activeView === 'autopsy' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
+              }`}
+            >
+              <FileText className="w-3 h-3 md:w-4 md:h-4" /> <span className="hidden md:inline">Daily Report</span><span className="md:hidden">Report</span>
+            </button>
+          </div>
+        </div>
         
-        {/* Trading Phase Badge */}
+        {/* Trading Phase Badge - Responsive */}
         {tradingPhase && (
-          <div className={`ml-4 px-3 py-1 rounded-full text-xs font-medium ${
+          <div className={`self-start sm:self-auto sm:ml-2 px-2 md:px-3 py-1 rounded-full text-[10px] md:text-xs font-medium ${
             tradingPhase.phase === 'ACTIVE' ? 'bg-green-500/20 text-green-400' :
             tradingPhase.phase === 'OBSERVATION' ? 'bg-yellow-500/20 text-yellow-400' :
             tradingPhase.phase === 'SQUAREOFF' ? 'bg-red-500/20 text-red-400' :
@@ -802,8 +806,8 @@ function App() {
 
       {/* Views with CSS display for chart persistence */}
       <div style={{ display: activeView === 'heatmap' ? 'block' : 'none' }}>
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
+          <div className="lg:col-span-2 order-1">
             <TechnicalHeatmap 
               onSelectTicker={(ticker) => {
                 setSelectedTicker(ticker);
@@ -812,7 +816,7 @@ function App() {
               activeTicker={selectedTicker}
             />
           </div>
-          <div>
+          <div className="order-2">
             <AIReasoningPanel ticker={selectedTicker} />
           </div>
         </div>
@@ -820,29 +824,29 @@ function App() {
 
       {/* Chart view - always mounted, hidden via CSS to preserve state */}
       <div style={{ display: activeView === 'chart' ? 'block' : 'none' }}>
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
+          <div className="lg:col-span-2 order-1">
             <TradingChart
               ticker={selectedTicker}
               candles={chartData.candles || []}
               indicators={chartData.indicators || {}}
               position={positions.find(p => p.ticker === selectedTicker)}
               trades={trades.filter(t => t.ticker === selectedTicker)}
-              height={500}
+              height={typeof window !== 'undefined' && window.innerWidth < 768 ? 350 : 500}
             />
           </div>
-          <div className="space-y-4">
+          <div className="space-y-3 md:space-y-4 order-2">
             <AIReasoningPanel ticker={selectedTicker} />
             
-            {/* Ticker Selector */}
-            <div className="bg-slate-800 rounded-lg p-4 border border-slate-700">
-              <h4 className="text-sm font-medium text-slate-400 mb-3">Select Ticker</h4>
-              <div className="flex flex-wrap gap-2">
+            {/* Ticker Selector - Mobile optimized */}
+            <div className="bg-slate-800 rounded-lg p-3 md:p-4 border border-slate-700">
+              <h4 className="text-xs md:text-sm font-medium text-slate-400 mb-2 md:mb-3">Select Ticker</h4>
+              <div className="flex flex-wrap gap-1.5 md:gap-2 max-h-32 overflow-y-auto">
                 {status?.watchlist?.map(ticker => (
                   <button
                     key={ticker}
                     onClick={() => setSelectedTicker(ticker)}
-                    className={`px-3 py-1 rounded-lg text-sm transition ${
+                    className={`px-2 md:px-3 py-1 rounded-lg text-xs md:text-sm transition ${
                       selectedTicker === ticker 
                         ? 'bg-blue-600 text-white' 
                         : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
@@ -862,36 +866,36 @@ function App() {
       </div>
 
       <div style={{ display: activeView === 'dashboard' ? 'block' : 'none' }}>
-          {/* Portfolio Overview */}
-          <div className="bg-gradient-to-r from-blue-900/50 to-purple-900/50 rounded-xl p-4 mb-6 border border-blue-500/30">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-4">
-                <Wallet className="w-8 h-8 text-blue-400" />
-                <div>
-                  <p className="text-gray-400 text-sm">Portfolio Value</p>
-                  <p className="text-2xl font-bold">₹{(status?.portfolio?.total_value || 100000).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+          {/* Portfolio Overview - Mobile Responsive */}
+          <div className="bg-gradient-to-r from-blue-900/50 to-purple-900/50 rounded-xl p-3 md:p-4 mb-4 md:mb-6 border border-blue-500/30">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
+              <div className="flex items-center gap-2 md:gap-4 col-span-2 md:col-span-1">
+                <Wallet className="w-6 h-6 md:w-8 md:h-8 text-blue-400 flex-shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-gray-400 text-xs md:text-sm">Portfolio Value</p>
+                  <p className="text-lg md:text-2xl font-bold truncate">₹{(status?.portfolio?.total_value || 100000).toLocaleString('en-IN', { minimumFractionDigits: 0 })}</p>
                 </div>
               </div>
-              <div className="text-right">
-                <p className="text-gray-400 text-sm">Available Cash</p>
-                <p className="text-xl font-mono text-green-400">₹{(status?.portfolio?.available_cash || 100000).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+              <div className="text-right md:text-right">
+                <p className="text-gray-400 text-xs md:text-sm">Available</p>
+                <p className="text-base md:text-xl font-mono text-green-400 truncate">₹{(status?.portfolio?.available_cash || 100000).toLocaleString('en-IN', { minimumFractionDigits: 0 })}</p>
               </div>
-              <div className="text-right">
-                <p className="text-gray-400 text-sm">Holdings Value</p>
-                <p className="text-xl font-mono">₹{(status?.portfolio?.holdings_value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+              <div className="text-left md:text-right">
+                <p className="text-gray-400 text-xs md:text-sm">Holdings</p>
+                <p className="text-base md:text-xl font-mono truncate">₹{(status?.portfolio?.holdings_value || 0).toLocaleString('en-IN', { minimumFractionDigits: 0 })}</p>
               </div>
-              <div className={`text-right px-4 py-2 rounded-lg ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
-                <p className="text-gray-400 text-sm">Total P&L</p>
-                <p className={`text-xl font-mono ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {(status?.portfolio?.total_pnl || 0) >= 0 ? '+' : ''}₹{(status?.portfolio?.total_pnl || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
-                  <span className="text-sm ml-1">({(status?.portfolio?.total_pnl_percent || 0).toFixed(2)}%)</span>
+              <div className={`text-right px-2 md:px-4 py-1 md:py-2 rounded-lg ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
+                <p className="text-gray-400 text-xs md:text-sm">Total P&L</p>
+                <p className={`text-base md:text-xl font-mono ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {(status?.portfolio?.total_pnl || 0) >= 0 ? '+' : ''}₹{(status?.portfolio?.total_pnl || 0).toLocaleString('en-IN', { minimumFractionDigits: 0 })}
+                  <span className="text-[10px] md:text-sm ml-1 block md:inline">({(status?.portfolio?.total_pnl_percent || 0).toFixed(1)}%)</span>
                 </p>
               </div>
             </div>
           </div>
 
-          {/* Stats Cards */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+          {/* Stats Cards - Mobile Responsive */}
+          <div className="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-2 md:gap-4 mb-4 md:mb-8">
         <StatCard
           title="Realized P&L"
           value={`₹${(status?.portfolio?.realized_pnl || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`}
@@ -919,15 +923,15 @@ function App() {
         />
       </div>
 
-      {/* Risk Bar */}
-      <div className="bg-sentinel-card rounded-xl p-4 mb-8 border border-sentinel-border">
+      {/* Risk Bar - Mobile Responsive */}
+      <div className="bg-sentinel-card rounded-xl p-3 md:p-4 mb-4 md:mb-8 border border-sentinel-border">
         <div className="flex items-center justify-between mb-2">
-          <span className="text-gray-400">Risk Utilization</span>
-          <span className="text-sm">
-            ₹{Math.abs(status?.risk?.mtm_loss || 0).toFixed(2)} / ₹{status?.risk?.limit?.toLocaleString()}
+          <span className="text-gray-400 text-xs md:text-sm">Risk Utilization</span>
+          <span className="text-xs md:text-sm">
+            ₹{Math.abs(status?.risk?.mtm_loss || 0).toFixed(0)} / ₹{status?.risk?.limit?.toLocaleString()}
           </span>
         </div>
-        <div className="h-3 bg-gray-700 rounded-full overflow-hidden">
+        <div className="h-2 md:h-3 bg-gray-700 rounded-full overflow-hidden">
           <div 
             className={`h-full transition-all duration-500 ${
               riskPercent > 80 ? 'bg-red-500' : riskPercent > 50 ? 'bg-yellow-500' : 'bg-green-500'
@@ -937,17 +941,17 @@ function App() {
         </div>
       </div>
 
-      {/* Main Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      {/* Main Grid - Mobile Responsive */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
         {/* Watchlist */}
-        <div className="bg-sentinel-card rounded-xl border border-sentinel-border">
-          <div className="p-4 border-b border-sentinel-border">
-            <h2 className="font-semibold flex items-center gap-2">
-              <TrendingUp className="w-5 h-5 text-blue-400" />
+        <div className="bg-sentinel-card rounded-xl border border-sentinel-border order-2 lg:order-1">
+          <div className="p-3 md:p-4 border-b border-sentinel-border">
+            <h2 className="font-semibold flex items-center gap-2 text-sm md:text-base">
+              <TrendingUp className="w-4 h-4 md:w-5 md:h-5 text-blue-400" />
               Watchlist
             </h2>
           </div>
-          <div className="p-4 space-y-2">
+          <div className="p-2 md:p-4 space-y-1 md:space-y-2 max-h-64 md:max-h-none overflow-y-auto">
             {status?.watchlist?.map(ticker => (
               <WatchlistItem
                 key={ticker}
@@ -963,28 +967,28 @@ function App() {
         </div>
 
         {/* Selected Ticker Details */}
-        <div className="lg:col-span-2 space-y-6">
-          {/* Ticker Info */}
-          <div className="bg-sentinel-card rounded-xl border border-sentinel-border p-4">
-            <div className="flex items-center justify-between mb-4">
+        <div className="lg:col-span-2 space-y-4 md:space-y-6 order-1 lg:order-2">
+          {/* Ticker Info - Mobile Responsive */}
+          <div className="bg-sentinel-card rounded-xl border border-sentinel-border p-3 md:p-4">
+            <div className="flex items-center justify-between mb-3 md:mb-4">
               <div>
-                <h2 className="text-xl font-bold">{selectedTicker}</h2>
-                <p className="text-3xl font-mono text-blue-400">
+                <h2 className="text-lg md:text-xl font-bold">{selectedTicker}</h2>
+                <p className="text-2xl md:text-3xl font-mono text-blue-400">
                   ₹{(status?.prices?.[selectedTicker] || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                 </p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex gap-1 md:gap-2">
                 <button
                   onClick={() => executeTrade(selectedTicker, 'BUY')}
                   disabled={!status?.running}
-                  className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded-lg transition"
+                  className="px-3 md:px-4 py-1.5 md:py-2 text-sm bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded-lg transition"
                 >
                   Buy
                 </button>
                 <button
                   onClick={() => closePosition(selectedTicker)}
                   disabled={!positions.some(p => p.ticker === selectedTicker)}
-                  className="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-lg transition"
+                  className="px-3 md:px-4 py-1.5 md:py-2 text-sm bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-lg transition"
                 >
                   Close
                 </button>

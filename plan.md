@@ -1,6 +1,6 @@
 # Sentinel Codebase Audit - Issues & Remediation Plan
 
-**Audit Date:** 2026-03-09  
+**Audit Date:** 2026-03-10 (Updated)  
 **Auditor:** Senior Software Architect & Security Engineer  
 **Scope:** Full codebase security, stability, performance, and AI-specific issues
 
@@ -10,10 +10,30 @@
 
 The Sentinel is a paper trading engine integrating Zerodha Kite API with Gemini AI for sentiment and visual analysis. The codebase is well-structured but contains several issues requiring attention across security, stability, and performance domains.
 
-**Critical Issues:** 2  
-**High Priority:** 6  
-**Medium Priority:** 8  
-**Low Priority:** 4  
+**Critical Issues:** 3 (NEW: +1)  
+**High Priority:** 7 (NEW: +1)  
+**Medium Priority:** 9 (NEW: +1)  
+**Low Priority:** 4
+
+---
+
+## 🔴 NEW CRITICAL: Exposed API Keys in .env
+
+### C0. Real API Keys Committed/Exposed
+**File:** `.env`  
+**Type:** Security - Credential Exposure  
+**Description:** The `.env` file contains real API keys for Zerodha Kite and Google Gemini:
+```
+KITE_API_KEY=ghd03fvwdy20i1mo
+KITE_API_SECRET=4v5c6j0uy9j3ucfhvgwif6va9qoqdgqo
+GEMINI_API_KEY='AIzaSyBWokdatlf0xzx4aozU2plWXBm-YPsqugU'
+```
+**Risk:** These credentials can be used to execute trades, access account data, or incur API costs.  
+**Fix:** 
+1. Rotate ALL exposed keys immediately
+2. Ensure `.env` is in `.gitignore` (verified: it is)
+3. Check git history for committed secrets
+4. Use placeholder values in `.env.example`  
 
 ---
 
@@ -212,21 +232,57 @@ closed = engine.executor.close_trade(ticker, reason="Manual close from dashboard
 
 ---
 
+## NEW: Additional Issues Found (2026-03-10)
+
+### H7. SQL Injection Vector in Database Stats
+**File:** `src/storage/db.py:792`  
+**Type:** SQL Injection  
+**Description:** Table name is interpolated directly into SQL query:
+```python
+result = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+```
+**Risk:** Although `table` comes from a hardcoded list, this pattern is dangerous.  
+**Fix:** Validate table name against whitelist or use parameterized identifier.
+
+### M9. Bare Except Clause in News Scraper
+**File:** `src/ingestion/news_scraper.py:198`  
+**Type:** Error Handling  
+**Description:** Bare `except:` clause swallows all exceptions silently:
+```python
+except:
+    pass
+```
+**Risk:** Hides bugs, makes debugging difficult.  
+**Fix:** Use specific exception types or at minimum log the error.
+
+### M10. Server Binds to 0.0.0.0
+**File:** `src/api/server.py:1722`  
+**Type:** Security - Network Exposure  
+**Description:** Server binds to all interfaces by default.  
+**Risk:** Exposes API to entire network, not just localhost.  
+**Fix:** Default to `127.0.0.1`, allow override via env var for production.
+
+---
+
 ## Remediation Priority Order
 
-1. **C1** - SSL Global Disable (Security Critical)
-2. **C2** - Division by Zero (Crash)
-3. **H3** - Stale model reference (Crash)
-4. **H6** - close_trade method mismatch (Crash)
-5. **M1** - ENV_FILE undefined (Crash)
-6. **H1** - Blocking sleep in async (Performance)
-7. **H4** - Race condition in cache (Data Integrity)
-8. **H5** - Silent WebSocket errors (Debugging)
-9. **H2** - Unprotected enum access (Stability)
-10. **M4** - CORS wildcard (Security)
-11. **M6** - Thread-unsafe singleton (Stability)
-12. **A1** - AI response edge cases (Reliability)
-13. **A2** - Confidence threshold (Trading Safety)
+1. **C0** - Exposed API Keys (IMMEDIATE - Rotate credentials)
+2. **C1** - SSL Global Disable (Security Critical)
+3. **C2** - Division by Zero (Crash)
+4. **H3** - Stale model reference (Crash)
+5. **H6** - close_trade method mismatch (Crash)
+6. **H7** - SQL Injection pattern (Security)
+7. **M1** - ENV_FILE undefined (Crash)
+8. **H1** - Blocking sleep in async (Performance)
+9. **H4** - Race condition in cache (Data Integrity)
+10. **H5** - Silent WebSocket errors (Debugging)
+11. **M9** - Bare except clause (Error Handling)
+12. **M10** - Server 0.0.0.0 binding (Security)
+13. **H2** - Unprotected enum access (Stability)
+14. **M4** - CORS wildcard (Security)
+15. **M6** - Thread-unsafe singleton (Stability)
+16. **A1** - AI response edge cases (Reliability)
+17. **A2** - Confidence threshold (Trading Safety)
 
 ---
 

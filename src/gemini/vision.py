@@ -193,14 +193,15 @@ Safety Guide:
                 
                 result = VisualAuditResponse.model_validate_json(response.text)
                 
+                # Defensive extraction with fallbacks for AI response edge cases
                 vision_result = VisionResult(
                     ticker=ticker,
-                    safety=result.safety.value,
-                    confidence=result.confidence,
-                    pattern_detected=result.pattern_detected,
-                    risk_factors=result.risk_factors,
-                    reasoning=result.reasoning,
-                    rsi_assessment=result.rsi_assessment.value
+                    safety=getattr(result.safety, 'value', str(result.safety)) if result.safety else "UNCERTAIN",
+                    confidence=float(result.confidence) if result.confidence is not None else 0.0,
+                    pattern_detected=result.pattern_detected or "Unknown",
+                    risk_factors=result.risk_factors if result.risk_factors else [],
+                    reasoning=result.reasoning or "No reasoning provided",
+                    rsi_assessment=getattr(result.rsi_assessment, 'value', str(result.rsi_assessment)) if result.rsi_assessment else "NEUTRAL"
                 )
                 
                 logger.info(f"Visual analysis for {ticker}: {vision_result.safety} "
@@ -278,14 +279,15 @@ Safety Guide:
                 
                 result = VisualAuditResponse.model_validate_json(response.text)
                 
+                # Defensive extraction with fallbacks for AI response edge cases
                 return VisionResult(
                     ticker=ticker,
-                    safety=result.safety.value,
-                    confidence=result.confidence,
-                    pattern_detected=result.pattern_detected,
-                    risk_factors=result.risk_factors,
-                    reasoning=result.reasoning,
-                    rsi_assessment=result.rsi_assessment.value if hasattr(result, 'rsi_assessment') else "NEUTRAL"
+                    safety=getattr(result.safety, 'value', str(result.safety)) if result.safety else "UNCERTAIN",
+                    confidence=float(result.confidence) if result.confidence is not None else 0.0,
+                    pattern_detected=result.pattern_detected or "Unknown",
+                    risk_factors=result.risk_factors if result.risk_factors else [],
+                    reasoning=result.reasoning or "No reasoning provided",
+                    rsi_assessment=getattr(result.rsi_assessment, 'value', str(result.rsi_assessment)) if hasattr(result, 'rsi_assessment') and result.rsi_assessment else "NEUTRAL"
                 )
                 
             except Exception as e:
