@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Shield, Activity, TrendingUp, TrendingDown, DollarSign, 
   AlertTriangle, Play, Square, Zap, BarChart3, Newspaper,
@@ -42,6 +42,18 @@ function App() {
   const [testingZerodha, setTestingZerodha] = useState(false);
   const [geminiTestResult, setGeminiTestResult] = useState(null);
   const [zerodhaTestResult, setZerodhaTestResult] = useState(null);
+  
+  // Toast notification state
+  const [toasts, setToasts] = useState([]);
+  
+  // Show toast notification
+  const showToast = useCallback((title, message, type = 'info') => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, title, message, type }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 5000);
+  }, []);
 
   // Fetch initial data
   const fetchData = useCallback(async () => {
@@ -98,37 +110,79 @@ function App() {
     }
   }, []);
 
-  // WebSocket connection
-  useEffect(() => {
-    fetchData();
+  // WebSocket connection with exponential backoff
+  const wsRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
+  const reconnectAttemptRef = useRef(0);
+  const maxReconnectAttempts = 10;
+  const baseReconnectDelay = 1000;
+
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
     
     const ws = new WebSocket(`ws://${window.location.hostname}:8000/ws`);
+    wsRef.current = ws;
     
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = () => setWsConnected(false);
+    ws.onopen = () => {
+      setWsConnected(true);
+      reconnectAttemptRef.current = 0;
+      console.log('WebSocket connected');
+    };
+    
+    ws.onclose = (event) => {
+      setWsConnected(false);
+      wsRef.current = null;
+      
+      // Don't reconnect if closed cleanly or max attempts reached
+      if (event.code === 1000 || reconnectAttemptRef.current >= maxReconnectAttempts) return;
+      
+      // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s (max)
+      const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttemptRef.current), 32000);
+      reconnectAttemptRef.current++;
+      console.log(`WebSocket reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current})`);
+      
+      reconnectTimeoutRef.current = setTimeout(connectWebSocket, delay);
+    };
+    
     ws.onerror = () => setWsConnected(false);
     
     ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === 'tick') {
-        setStatus(prev => ({
-          ...prev,
-          prices: data.prices,
-          stats: data.stats,
-          running: data.running
-        }));
-      } else if (data.type === 'trade_executed' || data.type === 'position_closed') {
-        fetchData();
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'tick') {
+          setStatus(prev => ({
+            ...prev,
+            prices: data.prices,
+            stats: data.stats,
+            running: data.running
+          }));
+        } else if (data.type === 'trade_executed' || data.type === 'position_closed') {
+          fetchData();
+          // Show toast notification for trades
+          showToast(
+            data.type === 'trade_executed' ? 'Trade Executed' : 'Position Closed',
+            `${data.ticker || 'Unknown'} - ${data.side || data.type}`,
+            data.type === 'trade_executed' ? 'success' : 'info'
+          );
+        }
+      } catch (e) {
+        console.error('WebSocket message parse error:', e);
       }
     };
+  }, [fetchData]);
 
+  useEffect(() => {
+    fetchData();
+    connectWebSocket();
+    
     const interval = setInterval(fetchData, 5000);
     
     return () => {
-      ws.close();
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (wsRef.current) wsRef.current.close(1000);
       clearInterval(interval);
     };
-  }, [fetchData]);
+  }, [fetchData, connectWebSocket]);
 
   // Fetch signals when ticker changes
   useEffect(() => {
@@ -320,13 +374,20 @@ function App() {
   // Execute trade
   const executeTrade = async (ticker, side) => {
     try {
-      await fetch(`${API_BASE}/trade`, {
+      const res = await fetch(`${API_BASE}/trade`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ticker, side })
       });
+      const data = await res.json();
+      if (data.success) {
+        showToast('Trade Executed', `${side} ${ticker} @ ₹${data.price?.toFixed(2) || 'N/A'}`, 'success');
+      } else {
+        showToast('Trade Failed', data.error || 'Unknown error', 'error');
+      }
       fetchData();
     } catch (error) {
+      showToast('Trade Error', error.message, 'error');
       console.error('Error executing trade:', error);
     }
   };
@@ -334,9 +395,17 @@ function App() {
   // Close position
   const closePosition = async (ticker) => {
     try {
-      await fetch(`${API_BASE}/close/${ticker}`, { method: 'POST' });
+      const res = await fetch(`${API_BASE}/close/${ticker}`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        showToast('Position Closed', `${ticker} closed with P&L: ₹${data.pnl?.toFixed(2) || 'N/A'}`, 
+          (data.pnl || 0) >= 0 ? 'success' : 'warning');
+      } else {
+        showToast('Close Failed', data.error || 'Unknown error', 'error');
+      }
       fetchData();
     } catch (error) {
+      showToast('Close Error', error.message, 'error');
       console.error('Error closing position:', error);
     }
   };
@@ -356,6 +425,38 @@ function App() {
 
   return (
     <div className="min-h-screen bg-sentinel-dark text-white p-6">
+      {/* Toast Notifications */}
+      <div className="fixed top-4 right-4 z-[100] flex flex-col gap-2">
+        {toasts.map(toast => (
+          <div 
+            key={toast.id}
+            className={`px-4 py-3 rounded-lg shadow-lg border animate-slide-in-right flex items-start gap-3 min-w-[300px] ${
+              toast.type === 'success' ? 'bg-green-900/90 border-green-500/50 text-green-100' :
+              toast.type === 'error' ? 'bg-red-900/90 border-red-500/50 text-red-100' :
+              toast.type === 'warning' ? 'bg-yellow-900/90 border-yellow-500/50 text-yellow-100' :
+              'bg-blue-900/90 border-blue-500/50 text-blue-100'
+            }`}
+          >
+            <div className="flex-shrink-0 mt-0.5">
+              {toast.type === 'success' ? <CheckCircle className="w-5 h-5" /> :
+               toast.type === 'error' ? <XCircle className="w-5 h-5" /> :
+               toast.type === 'warning' ? <AlertTriangle className="w-5 h-5" /> :
+               <Activity className="w-5 h-5" />}
+            </div>
+            <div>
+              <p className="font-semibold text-sm">{toast.title}</p>
+              <p className="text-xs opacity-80">{toast.message}</p>
+            </div>
+            <button 
+              onClick={() => setToasts(prev => prev.filter(t => t.id !== toast.id))}
+              className="ml-auto opacity-60 hover:opacity-100"
+            >
+              <XCircle className="w-4 h-4" />
+            </button>
+          </div>
+        ))}
+      </div>
+
       {/* Header */}
       <header className="flex items-center justify-between mb-8">
         <div className="flex items-center gap-4">
@@ -699,8 +800,8 @@ function App() {
         )}
       </div>
 
-      {/* Conditional Views */}
-      {activeView === 'heatmap' && (
+      {/* Views with CSS display for chart persistence */}
+      <div style={{ display: activeView === 'heatmap' ? 'block' : 'none' }}>
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2">
             <TechnicalHeatmap 
@@ -715,9 +816,10 @@ function App() {
             <AIReasoningPanel ticker={selectedTicker} />
           </div>
         </div>
-      )}
+      </div>
 
-      {activeView === 'chart' && (
+      {/* Chart view - always mounted, hidden via CSS to preserve state */}
+      <div style={{ display: activeView === 'chart' ? 'block' : 'none' }}>
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2">
             <TradingChart
@@ -753,11 +855,11 @@ function App() {
             </div>
           </div>
         </div>
-      )}
+      </div>
 
-      {activeView === 'autopsy' && (
-        <DailyAutopsy isVisible={true} />
-      )}
+      <div style={{ display: activeView === 'autopsy' ? 'block' : 'none' }}>
+        <DailyAutopsy isVisible={activeView === 'autopsy'} />
+      </div>
 
       {activeView === 'dashboard' && (
         <>
@@ -771,23 +873,23 @@ function App() {
                   <p className="text-2xl font-bold">₹{(status?.portfolio?.total_value || 100000).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
                 </div>
               </div>
-          <div className="text-right">
-            <p className="text-gray-400 text-sm">Available Cash</p>
-            <p className="text-xl font-mono text-green-400">₹{(status?.portfolio?.available_cash || 100000).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+              <div className="text-right">
+                <p className="text-gray-400 text-sm">Available Cash</p>
+                <p className="text-xl font-mono text-green-400">₹{(status?.portfolio?.available_cash || 100000).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+              </div>
+              <div className="text-right">
+                <p className="text-gray-400 text-sm">Holdings Value</p>
+                <p className="text-xl font-mono">₹{(status?.portfolio?.holdings_value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+              </div>
+              <div className={`text-right px-4 py-2 rounded-lg ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
+                <p className="text-gray-400 text-sm">Total P&L</p>
+                <p className={`text-xl font-mono ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {(status?.portfolio?.total_pnl || 0) >= 0 ? '+' : ''}₹{(status?.portfolio?.total_pnl || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                  <span className="text-sm ml-1">({(status?.portfolio?.total_pnl_percent || 0).toFixed(2)}%)</span>
+                </p>
+              </div>
+            </div>
           </div>
-          <div className="text-right">
-            <p className="text-gray-400 text-sm">Holdings Value</p>
-            <p className="text-xl font-mono">₹{(status?.portfolio?.holdings_value || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
-          </div>
-          <div className={`text-right px-4 py-2 rounded-lg ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
-            <p className="text-gray-400 text-sm">Total P&L</p>
-            <p className={`text-xl font-mono ${(status?.portfolio?.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {(status?.portfolio?.total_pnl || 0) >= 0 ? '+' : ''}₹{(status?.portfolio?.total_pnl || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
-              <span className="text-sm ml-1">({(status?.portfolio?.total_pnl_percent || 0).toFixed(2)}%)</span>
-            </p>
-          </div>
-        </div>
-      </div>
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">

@@ -60,6 +60,34 @@ from src.gemini.vision import MockVisualAuditor
 from src.gemini.technical_analyst import MockTechnicalAnalyst
 from src.charts.generator import ChartGenerator
 from src.ingestion.news_scraper import NewsScraper, MockNewsScraper
+import numpy as np
+import pandas as pd
+
+
+def sanitize_for_json(obj):
+    """
+    Recursively convert numpy/pandas types to native Python types for JSON serialization.
+    Prevents 'numpy.bool is not JSON serializable' errors.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, (np.bool_, np.bool8)):
+        return bool(obj)
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj) if not np.isnan(obj) else None
+    elif isinstance(obj, np.ndarray):
+        return sanitize_for_json(obj.tolist())
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif isinstance(obj, (pd.Series, pd.DataFrame)):
+        return sanitize_for_json(obj.to_dict())
+    elif pd.isna(obj):
+        return None
+    return obj
 
 
 class ConnectionManager:
@@ -790,7 +818,7 @@ async def get_confluence_status(ticker: str):
     rsi_check = bool(latest_rsi is not None and latest_rsi > 60)
     vwap_check = bool(latest_vwap is not None and latest_price > latest_vwap)
     
-    return {
+    return sanitize_for_json({
         "ticker": ticker,
         "confluence_met": bool(result.is_valid),
         "signal_type": result.signal_type.value if result.signal_type else None,
@@ -824,7 +852,7 @@ async def get_confluence_status(ticker: str):
         },
         "volume": volume_data,
         "timestamp": datetime.now().isoformat()
-    }
+    })
 
 
 @app.get("/api/sentiment/{ticker}")
@@ -921,7 +949,7 @@ async def get_chart_data(ticker: str, interval: str = "5min", limit: int = 100):
     
     import pandas as pd
     
-    return {
+    return sanitize_for_json({
         "ticker": ticker,
         "interval": interval,
         "candles": formatted_candles,
@@ -933,7 +961,7 @@ async def get_chart_data(ticker: str, interval: str = "5min", limit: int = 100):
             "rsi": format_series(rsi, candles)
         },
         "count": len(formatted_candles)
-    }
+    })
 
 
 @app.get("/api/schedule/phase")
@@ -1008,12 +1036,12 @@ async def get_nifty50_heatmap():
                 "stocks": sectors_data[sector]
             })
     
-    return {
+    return sanitize_for_json({
         "stocks": heatmap_data,
         "sectors": ordered_sectors,
         "timestamp": datetime.now().isoformat(),
         "total_stocks": len(heatmap_data)
-    }
+    })
 
 
 @app.get("/api/autopsy/daily")
