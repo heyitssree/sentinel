@@ -6,15 +6,22 @@ HYBRID KILL SWITCH:
 - Hard-coded safety ceiling (3%) in .env - AI cannot override
 - User-configurable limit via UI (e.g., 2%)
 - System enforces the LOWER of the two limits
+
+REGIME INTEGRATION:
+- When CHOPPY regime detected, kill switch limit reduced by 50%
+- Prevents "death by a thousand cuts" in sideways markets
 """
 from datetime import datetime, time as dt_time
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
 import threading
 import time
 import logging
 import os
 from dataclasses import dataclass
 from collections import deque
+
+if TYPE_CHECKING:
+    from src.gemini.regime_detector import RegimeState
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,10 @@ class HybridKillSwitch:
         self._disabled_for_day = False
         self._disabled_date: Optional[datetime] = None
         
+        # Regime-based multiplier (1.0 = full limit, 0.5 = half for CHOPPY)
+        self._regime_multiplier = 1.0
+        self._regime_adjusted_limit = self._effective_limit
+        
         logger.info(
             f"HybridKillSwitch initialized: "
             f"ceiling={self._ceiling_percent*100:.1f}% (₹{self._ceiling_amount:,.0f}), "
@@ -91,8 +102,18 @@ class HybridKillSwitch:
     
     @property
     def limit(self) -> float:
-        """Get the effective MTM loss limit (read-only)."""
+        """Get the effective MTM loss limit (regime-adjusted, read-only)."""
+        return self._regime_adjusted_limit
+    
+    @property
+    def base_limit(self) -> float:
+        """Get the base effective limit before regime adjustment."""
         return self._effective_limit
+    
+    @property
+    def regime_multiplier(self) -> float:
+        """Get the current regime multiplier."""
+        return self._regime_multiplier
     
     @property
     def ceiling(self) -> float:
@@ -142,13 +163,46 @@ class HybridKillSwitch:
             self._user_limit_percent = limit_percent
             self._user_limit_amount = self._starting_capital * limit_percent
             self._effective_limit = min(self._ceiling_amount, self._user_limit_amount)
+            self._regime_adjusted_limit = self._effective_limit * self._regime_multiplier
             
             logger.info(f"User limit updated to {limit_percent*100:.1f}% (₹{self._user_limit_amount:,.0f})")
             return True
     
+    def apply_regime_multiplier(self, multiplier: float, regime_name: str = ""):
+        """
+        Apply regime-based multiplier to the kill switch limit.
+        
+        When CHOPPY regime detected, multiplier = 0.5 to tighten the limit
+        and prevent "death by a thousand cuts" in sideways markets.
+        
+        Args:
+            multiplier: Multiplier to apply (0.5 = half limit, 1.0 = full)
+            regime_name: Name of the regime for logging
+        """
+        with self._lock:
+            old_multiplier = self._regime_multiplier
+            self._regime_multiplier = max(0.1, min(1.0, multiplier))  # Clamp 0.1-1.0
+            self._regime_adjusted_limit = self._effective_limit * self._regime_multiplier
+            
+            if old_multiplier != self._regime_multiplier:
+                logger.info(
+                    f"Kill switch limit adjusted for {regime_name} regime: "
+                    f"₹{self._effective_limit:,.0f} × {self._regime_multiplier:.0%} = "
+                    f"₹{self._regime_adjusted_limit:,.0f}"
+                )
+    
+    def reset_regime_multiplier(self):
+        """Reset regime multiplier to 1.0 (full limit)."""
+        with self._lock:
+            self._regime_multiplier = 1.0
+            self._regime_adjusted_limit = self._effective_limit
+            logger.info(f"Kill switch regime multiplier reset to 1.0")
+    
     def check(self, current_mtm_loss: float) -> bool:
         """
         Check if MTM loss exceeds limit and trigger if necessary.
+        
+        Uses regime-adjusted limit (tighter in CHOPPY markets).
         
         Args:
             current_mtm_loss: Current mark-to-market loss (positive = loss)
@@ -160,10 +214,15 @@ class HybridKillSwitch:
             if self._triggered or self._disabled_for_day:
                 return False
             
-            if current_mtm_loss >= self._effective_limit:
+            # Use regime-adjusted limit
+            if current_mtm_loss >= self._regime_adjusted_limit:
+                regime_note = ""
+                if self._regime_multiplier < 1.0:
+                    regime_note = f" [REGIME: {self._regime_multiplier:.0%} of base]"
+                
                 self._trigger(
                     f"MTM loss ₹{current_mtm_loss:,.2f} exceeded limit "
-                    f"₹{self._effective_limit:,.2f} ({self._user_limit_percent*100:.1f}%)"
+                    f"₹{self._regime_adjusted_limit:,.2f}{regime_note}"
                 )
                 return False
             

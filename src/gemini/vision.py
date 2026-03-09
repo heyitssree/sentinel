@@ -1,16 +1,23 @@
 """
 Gemini Vision Module (Feature B: Visual Auditor).
 Analyzes candlestick charts to validate trading signals.
+
+Upgraded to google-genai SDK with:
+- New client API
+- Pydantic structured outputs
 """
-import google.generativeai as genai
+import os
+import time
+import logging
 from typing import Optional, Tuple, List
 from pathlib import Path
 import base64
-import json
-import re
-import time
-import logging
 from dataclasses import dataclass
+
+from google import genai
+from google.genai import types
+
+from .models import VisualAuditResponse, SafetyLevel, RSIAssessment
 
 logger = logging.getLogger(__name__)
 
@@ -82,17 +89,31 @@ Respond in this exact JSON format:
 
 Return ONLY the JSON, no additional text."""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+    SYSTEM_INSTRUCTION = """You are a technical analysis expert examining candlestick charts for Indian stocks.
+Your role is to assess whether it's SAFE or RISKY to enter a long position.
+
+Analysis Criteria:
+1. Overextension: Is RSI > 80? Is price far above moving averages?
+2. Pattern Recognition: Cup & Handle, Bull Flag, Breakout, or warning patterns
+3. Volume: Is there volume confirmation for the move?
+4. Trend Structure: Are there higher highs and higher lows?
+
+Safety Guide:
+- SAFE: Clean breakout, healthy pullback, RSI 50-70, good volume
+- RISKY: Vertical spike, RSI > 80, exhaustion candles, no volume
+- UNCERTAIN: Mixed signals, choppy price action"""
+
+    def __init__(self, api_key: str = None, model: str = "gemini-2.5-flash"):
         """
         Initialize the visual auditor.
         
         Args:
-            api_key: Google Gemini API key
+            api_key: Google Gemini API key (or uses GEMINI_API_KEY env var)
             model: Gemini model to use (must support vision)
         """
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model_name = model
-        self._setup_client()
+        self.client = genai.Client(api_key=self.api_key)
         
         # Rate limiting
         self._last_request_time = 0
@@ -101,12 +122,8 @@ Return ONLY the JSON, no additional text."""
         # Retry settings
         self.max_retries = 3
         self.retry_delay = 3.0
-    
-    def _setup_client(self):
-        """Configure the Gemini client."""
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(self.model_name)
-        logger.info(f"Gemini visual auditor initialized with {self.model_name}")
+        
+        logger.info(f"Gemini visual auditor initialized with {self.model_name} (new SDK)")
     
     def _rate_limit(self):
         """Enforce rate limiting between requests."""
@@ -115,44 +132,14 @@ Return ONLY the JSON, no additional text."""
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
     
-    def _load_image(self, image_path: str) -> dict:
-        """Load image and prepare for Gemini API."""
+    def _load_image(self, image_path: str) -> bytes:
+        """Load image bytes from file."""
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"Chart image not found: {image_path}")
         
         with open(path, 'rb') as f:
-            image_data = f.read()
-        
-        return {
-            'mime_type': 'image/png',
-            'data': base64.standard_b64encode(image_data).decode('utf-8')
-        }
-    
-    def _parse_response(self, response_text: str) -> dict:
-        """Parse JSON from Gemini response."""
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            pass
-        
-        # Try to find JSON in markdown code block
-        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-        
-        # Try to find JSON object directly
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
-        
-        raise ValueError(f"Could not parse JSON from response: {response_text[:200]}")
+            return f.read()
     
     def analyze_chart(self, ticker: str, chart_path: str) -> VisionResult:
         """
@@ -179,27 +166,41 @@ Return ONLY the JSON, no additional text."""
                 rsi_assessment="NEUTRAL"
             )
         
-        prompt = self.VISION_PROMPT.format(ticker=ticker)
+        prompt = f"Analyze this chart for {ticker} and assess whether it's SAFE or RISKY to enter a long position."
         
         for attempt in range(self.max_retries):
             try:
                 self._rate_limit()
                 
-                response = self.model.generate_content([
-                    prompt,
-                    {'inline_data': image_data}
-                ])
+                # Use new SDK with Pydantic structured output
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=[
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(prompt),
+                                types.Part.from_bytes(data=image_data, mime_type="image/png")
+                            ]
+                        )
+                    ],
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=VisualAuditResponse,
+                    )
+                )
                 
-                result = self._parse_response(response.text)
+                result = VisualAuditResponse.model_validate_json(response.text)
                 
                 vision_result = VisionResult(
                     ticker=ticker,
-                    safety=result.get('safety', 'UNCERTAIN'),
-                    confidence=max(0.0, min(1.0, float(result.get('confidence', 0.5)))),
-                    pattern_detected=result.get('pattern_detected', 'None'),
-                    risk_factors=result.get('risk_factors', []),
-                    reasoning=result.get('reasoning', 'No reasoning provided'),
-                    rsi_assessment=result.get('rsi_assessment', 'NEUTRAL')
+                    safety=result.safety.value,
+                    confidence=result.confidence,
+                    pattern_detected=result.pattern_detected,
+                    risk_factors=result.risk_factors,
+                    reasoning=result.reasoning,
+                    rsi_assessment=result.rsi_assessment.value
                 )
                 
                 logger.info(f"Visual analysis for {ticker}: {vision_result.safety} "
@@ -260,19 +261,31 @@ Return ONLY the JSON, no additional text."""
             try:
                 self._rate_limit()
                 
-                content = [prompt] + [{'inline_data': img} for img in images]
-                response = self.model.generate_content(content)
+                # Build parts list for multi-image request using new SDK
+                parts = [types.Part.from_text(prompt)]
+                for img in images:
+                    parts.append(types.Part.from_bytes(data=img, mime_type="image/png"))
                 
-                result = self._parse_response(response.text)
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=[types.Content(role="user", parts=parts)],
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=VisualAuditResponse,
+                    )
+                )
+                
+                result = VisualAuditResponse.model_validate_json(response.text)
                 
                 return VisionResult(
                     ticker=ticker,
-                    safety=result.get('safety', 'UNCERTAIN'),
-                    confidence=max(0.0, min(1.0, float(result.get('confidence', 0.5)))),
-                    pattern_detected=result.get('pattern_detected', 'None'),
-                    risk_factors=result.get('risk_factors', []),
-                    reasoning=result.get('reasoning', 'No reasoning provided'),
-                    rsi_assessment=result.get('rsi_assessment', 'NEUTRAL')
+                    safety=result.safety.value,
+                    confidence=result.confidence,
+                    pattern_detected=result.pattern_detected,
+                    risk_factors=result.risk_factors,
+                    reasoning=result.reasoning,
+                    rsi_assessment=result.rsi_assessment.value if hasattr(result, 'rsi_assessment') else "NEUTRAL"
                 )
                 
             except Exception as e:
@@ -312,32 +325,41 @@ Return ONLY the JSON, no additional text."""
                 rsi_assessment="NEUTRAL"
             )
         
-        image_data = {
-            'mime_type': 'image/png',
-            'data': base64.standard_b64encode(image_bytes).decode('utf-8')
-        }
-        
-        prompt = self.VISION_PROMPT.format(ticker=ticker)
+        prompt = f"Analyze this chart for {ticker} and assess whether it's SAFE or RISKY to enter a long position."
         
         for attempt in range(self.max_retries):
             try:
                 self._rate_limit()
                 
-                response = self.model.generate_content([
-                    prompt,
-                    {'inline_data': image_data}
-                ])
+                # Use new SDK with Pydantic structured output
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=[
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(prompt),
+                                types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+                            ]
+                        )
+                    ],
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=VisualAuditResponse,
+                    )
+                )
                 
-                result = self._parse_response(response.text)
+                result = VisualAuditResponse.model_validate_json(response.text)
                 
                 return VisionResult(
                     ticker=ticker,
-                    safety=result.get('safety', 'UNCERTAIN'),
-                    confidence=max(0.0, min(1.0, float(result.get('confidence', 0.5)))),
-                    pattern_detected=result.get('pattern_detected', 'None'),
-                    risk_factors=result.get('risk_factors', []),
-                    reasoning=result.get('reasoning', 'No reasoning provided'),
-                    rsi_assessment=result.get('rsi_assessment', 'NEUTRAL')
+                    safety=result.safety.value,
+                    confidence=result.confidence,
+                    pattern_detected=result.pattern_detected,
+                    risk_factors=result.risk_factors,
+                    reasoning=result.reasoning,
+                    rsi_assessment=result.rsi_assessment.value if hasattr(result, 'rsi_assessment') else "NEUTRAL"
                 )
                 
             except Exception as e:
@@ -355,23 +377,37 @@ Return ONLY the JSON, no additional text."""
             rsi_assessment="NEUTRAL"
         )
     
-    def is_safe_to_enter(self, ticker: str, chart_path: str) -> Tuple[bool, VisionResult]:
+    def is_safe_to_enter(self, ticker: str, chart_path: str, 
+                          min_confidence: float = 0.6) -> Tuple[bool, VisionResult]:
         """
         Determine if chart analysis supports entering a trade.
         
         Args:
             ticker: Stock ticker
             chart_path: Path to chart image
+            min_confidence: Minimum confidence threshold (default 0.6)
             
         Returns:
             Tuple of (is_safe, vision_result)
         """
         result = self.analyze_chart(ticker, chart_path)
-        is_safe = result.safety == "SAFE" and result.rsi_assessment != "OVERBOUGHT"
+        
+        # Require SAFE assessment, not overbought RSI, AND sufficient confidence
+        is_safe = (
+            result.safety == "SAFE" and 
+            result.rsi_assessment != "OVERBOUGHT" and
+            result.confidence >= min_confidence
+        )
         
         if not is_safe:
-            logger.info(f"Visual audit blocked trade for {ticker}: "
-                       f"safety={result.safety}, rsi={result.rsi_assessment}")
+            reasons = []
+            if result.safety != "SAFE":
+                reasons.append(f"safety={result.safety}")
+            if result.rsi_assessment == "OVERBOUGHT":
+                reasons.append(f"rsi={result.rsi_assessment}")
+            if result.confidence < min_confidence:
+                reasons.append(f"low_confidence={result.confidence:.2f}<{min_confidence}")
+            logger.info(f"Visual audit blocked trade for {ticker}: {', '.join(reasons)}")
         
         return is_safe, result
 

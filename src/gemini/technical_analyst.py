@@ -2,15 +2,24 @@
 Gemini Technical Analysis Module - Direct Data Analysis.
 Analyzes raw OHLCV + indicator data instead of chart images.
 More efficient and accurate than vision-based analysis.
+
+Upgraded to google-genai SDK with:
+- Async client for parallel processing
+- Pydantic structured outputs (no manual JSON parsing)
+- System instructions for cleaner prompts
 """
-import google.generativeai as genai
-from typing import List, Optional, Dict, Tuple
-import pandas as pd
-import json
-import re
+import asyncio
+import os
 import time
 import logging
+from typing import List, Dict, Tuple
 from dataclasses import dataclass
+
+import pandas as pd
+from google import genai
+from google.genai import types
+
+from .models import TechnicalAnalysisResponse, RecommendationType
 
 logger = logging.getLogger(__name__)
 
@@ -30,62 +39,47 @@ class TechnicalAnalysisResult:
 
 class TechnicalAnalyst:
     """
-    Analyzes raw market data using Gemini 2.0 Flash.
-    Provides pattern detection and trade recommendations from numerical data.
+    Analyzes raw market data using Gemini 2.5 Flash.
+    Uses google-genai SDK with Pydantic structured outputs.
     """
     
-    ANALYSIS_PROMPT = """You are an expert technical analyst for Indian stock markets.
-Analyze the following market data for {ticker} and provide a trading recommendation.
+    SYSTEM_INSTRUCTION = """You are an expert technical analyst for Indian stock markets.
+Your role is to analyze OHLCV data and technical indicators to provide trading recommendations.
 
-CURRENT INDICATORS:
-- Price: ₹{current_price:.2f}
-- RSI (14): {rsi:.2f}
-- VWAP: ₹{vwap:.2f} (Price vs VWAP: {price_vs_vwap:+.2f}%)
-- EMA20: ₹{ema20:.2f}
-- EMA50: ₹{ema50:.2f}
+Analysis Framework:
+1. Identify chart patterns (head & shoulders, double top/bottom, flags, wedges, etc.)
+2. Assess trend direction and strength using EMAs
+3. Identify key support and resistance levels from price action
+4. Evaluate momentum using RSI and price vs VWAP
+5. Consider risk factors that could invalidate the setup
 
-RECENT OHLCV DATA (last 10 candles, newest first):
-{candle_data}
-
-INSTRUCTIONS:
-1. Identify any chart patterns (head & shoulders, double top/bottom, flags, wedges, etc.)
-2. Assess trend direction and strength
-3. Identify key support and resistance levels
-4. Evaluate momentum and potential reversals
-5. Consider risk factors
-
-Respond in this exact JSON format:
-{{
-    "recommendation": "<BUY|SELL|HOLD>",
-    "confidence": <float between 0.0 and 1.0>,
-    "pattern_detected": "<pattern name or 'None'>",
-    "support_level": <float>,
-    "resistance_level": <float>,
-    "risk_factors": ["<factor1>", "<factor2>"],
-    "reasoning": "<brief 2-3 sentence explanation>"
-}}
-
-RECOMMENDATION GUIDE:
+Recommendation Guide:
 - BUY: Strong bullish signals, good risk/reward, momentum supportive
 - SELL: Bearish signals, resistance hit, momentum fading
-- HOLD: Mixed signals, wait for clearer setup
-"""
+- HOLD: Mixed signals, wait for clearer setup"""
 
     def __init__(self, api_key: str = None, model_name: str = "gemini-2.5-flash"):
-        if api_key:
-            genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self.model_name = model_name
+        self.client = genai.Client(api_key=self.api_key)
         self.max_retries = 3
         self.retry_delay = 1.0
         self._last_call = 0
         self._min_interval = 0.5  # Rate limiting
-        logger.info(f"Technical analyst initialized with {model_name}")
+        logger.info(f"Technical analyst initialized with {model_name} (new SDK)")
     
     def _rate_limit(self):
         """Ensure minimum interval between API calls."""
         elapsed = time.time() - self._last_call
         if elapsed < self._min_interval:
             time.sleep(self._min_interval - elapsed)
+        self._last_call = time.time()
+    
+    async def _rate_limit_async(self):
+        """Async rate limiting."""
+        elapsed = time.time() - self._last_call
+        if elapsed < self._min_interval:
+            await asyncio.sleep(self._min_interval - elapsed)
         self._last_call = time.time()
     
     def _format_candle_data(self, candles: pd.DataFrame) -> str:
@@ -97,32 +91,6 @@ RECOMMENDATION GUIDE:
                 f"L:{row['low']:.2f} C:{row['close']:.2f} V:{int(row['volume'])}"
             )
         return "\n".join(lines)
-    
-    def _parse_response(self, response_text: str) -> dict:
-        """Parse JSON from model response."""
-        # Try direct JSON parse
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            pass
-        
-        # Try to extract JSON from markdown code blocks
-        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-        
-        # Try to find JSON object in text
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
-        
-        raise ValueError(f"Could not parse JSON from response: {response_text[:200]}")
     
     def analyze(self, ticker: str, candles: pd.DataFrame, 
                 indicators: Dict[str, float]) -> TechnicalAnalysisResult:
@@ -153,37 +121,50 @@ RECOMMENDATION GUIDE:
         vwap = indicators.get('vwap', current_price)
         price_vs_vwap = ((current_price - vwap) / vwap) * 100 if vwap > 0 else 0
         
-        prompt = self.ANALYSIS_PROMPT.format(
-            ticker=ticker,
-            current_price=current_price,
-            rsi=indicators.get('rsi', 50),
-            vwap=vwap,
-            price_vs_vwap=price_vs_vwap,
-            ema20=indicators.get('ema20', current_price),
-            ema50=indicators.get('ema50', current_price),
-            candle_data=self._format_candle_data(candles)
-        )
+        prompt = f"""Analyze the following market data for {ticker} and provide a trading recommendation.
+
+CURRENT INDICATORS:
+- Price: ₹{current_price:.2f}
+- RSI (14): {indicators.get('rsi', 50):.2f}
+- VWAP: ₹{vwap:.2f} (Price vs VWAP: {price_vs_vwap:+.2f}%)
+- EMA20: ₹{indicators.get('ema20', current_price):.2f}
+- EMA50: ₹{indicators.get('ema50', current_price):.2f}
+
+RECENT OHLCV DATA (last 10 candles, newest first):
+{self._format_candle_data(candles)}
+
+Provide your analysis."""
         
         for attempt in range(self.max_retries):
             try:
                 self._rate_limit()
                 
-                response = self.model.generate_content(prompt)
-                result = self._parse_response(response.text)
+                # Use Pydantic structured output - no JSON parsing needed
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=TechnicalAnalysisResponse,
+                    )
+                )
+                
+                result = TechnicalAnalysisResponse.model_validate_json(response.text)
                 
                 analysis_result = TechnicalAnalysisResult(
                     ticker=ticker,
-                    recommendation=result.get('recommendation', 'HOLD'),
-                    confidence=max(0.0, min(1.0, float(result.get('confidence', 0.5)))),
-                    pattern_detected=result.get('pattern_detected', 'None'),
-                    support_level=float(result.get('support_level', 0)),
-                    resistance_level=float(result.get('resistance_level', 0)),
-                    risk_factors=result.get('risk_factors', []),
-                    reasoning=result.get('reasoning', 'No reasoning provided')
+                    recommendation=result.recommendation.value,
+                    confidence=result.confidence,
+                    pattern_detected=result.pattern_detected,
+                    support_level=result.support_level,
+                    resistance_level=result.resistance_level,
+                    risk_factors=result.risk_factors,
+                    reasoning=result.reasoning
                 )
                 
-                logger.info(f"Technical analysis for {ticker}: {analysis_result.recommendation} "
-                           f"(confidence: {analysis_result.confidence:.2f}, pattern: {analysis_result.pattern_detected})")
+                logger.info(f"Technical analysis for {ticker}: {result.recommendation.value} "
+                           f"(confidence: {result.confidence:.2f}, pattern: {result.pattern_detected})")
                 return analysis_result
                 
             except Exception as e:
@@ -192,6 +173,84 @@ RECOMMENDATION GUIDE:
                     time.sleep(self.retry_delay * (attempt + 1))
                 else:
                     logger.error(f"All technical analysis attempts failed for {ticker}")
+                    return TechnicalAnalysisResult(
+                        ticker=ticker,
+                        recommendation="HOLD",
+                        confidence=0.0,
+                        pattern_detected="None",
+                        support_level=0.0,
+                        resistance_level=0.0,
+                        risk_factors=[f"Analysis failed: {str(e)}"],
+                        reasoning="Technical analysis encountered an error"
+                    )
+    
+    async def analyze_async(self, ticker: str, candles: pd.DataFrame,
+                           indicators: Dict[str, float]) -> TechnicalAnalysisResult:
+        """
+        Async version of technical analysis for parallel processing.
+        """
+        if candles.empty or len(candles) < 5:
+            return TechnicalAnalysisResult(
+                ticker=ticker,
+                recommendation="HOLD",
+                confidence=0.0,
+                pattern_detected="None",
+                support_level=0.0,
+                resistance_level=0.0,
+                risk_factors=["Insufficient data"],
+                reasoning="Not enough candle data for analysis"
+            )
+        
+        current_price = indicators.get('current_price', candles.iloc[0]['close'])
+        vwap = indicators.get('vwap', current_price)
+        price_vs_vwap = ((current_price - vwap) / vwap) * 100 if vwap > 0 else 0
+        
+        prompt = f"""Analyze the following market data for {ticker} and provide a trading recommendation.
+
+CURRENT INDICATORS:
+- Price: ₹{current_price:.2f}
+- RSI (14): {indicators.get('rsi', 50):.2f}
+- VWAP: ₹{vwap:.2f} (Price vs VWAP: {price_vs_vwap:+.2f}%)
+- EMA20: ₹{indicators.get('ema20', current_price):.2f}
+- EMA50: ₹{indicators.get('ema50', current_price):.2f}
+
+RECENT OHLCV DATA (last 10 candles, newest first):
+{self._format_candle_data(candles)}
+
+Provide your analysis."""
+        
+        for attempt in range(self.max_retries):
+            try:
+                await self._rate_limit_async()
+                
+                response = await self.client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=TechnicalAnalysisResponse,
+                    )
+                )
+                
+                result = TechnicalAnalysisResponse.model_validate_json(response.text)
+                
+                return TechnicalAnalysisResult(
+                    ticker=ticker,
+                    recommendation=result.recommendation.value,
+                    confidence=result.confidence,
+                    pattern_detected=result.pattern_detected,
+                    support_level=result.support_level,
+                    resistance_level=result.resistance_level,
+                    risk_factors=result.risk_factors,
+                    reasoning=result.reasoning
+                )
+                
+            except Exception as e:
+                logger.warning(f"Async technical analysis attempt {attempt+1} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+                else:
                     return TechnicalAnalysisResult(
                         ticker=ticker,
                         recommendation="HOLD",

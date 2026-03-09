@@ -12,8 +12,8 @@ numpy>=1.24.0
 feedparser>=6.0.0
 requests>=2.31.0
 
-# Gemini AI
-google-generativeai>=0.5.0
+# Gemini AI (new SDK with async + Pydantic support)
+google-genai[aiohttp]>=1.0.0
 
 # Charting
 matplotlib>=3.7.0

@@ -7,17 +7,27 @@ Features:
 - Automatic report generation and saving
 - Performance metrics tracking
 - Improvement suggestions based on trade patterns
+- Thinking mode for deep chain-of-thought reasoning
+- Opportunity cost analysis (price 2h post-exit)
+
+Upgraded to google-genai SDK with:
+- Pydantic structured outputs
+- Thinking mode for complex analysis
+- System instructions
 """
-import google.generativeai as genai
-from typing import List, Dict, Optional
+import os
 import json
-import re
 import time
 import logging
-import os
-from datetime import datetime
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+from google import genai
+from google.genai import types
+
+from .models import AutopsyResponse, ExitTimingVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -43,62 +53,46 @@ class AutopsyResult:
 
 class PostTradeAutopsy:
     """
-    Reviews daily trades using Gemini and provides actionable feedback.
+    Reviews daily trades using Gemini with thinking mode for deep analysis.
+    Uses google-genai SDK with Pydantic structured outputs.
     """
     
-    AUTOPSY_PROMPT = """You are a trading coach reviewing a day's paper trading activity.
+    SYSTEM_INSTRUCTION = """You are an expert trading coach reviewing paper trading activity for Indian stock markets.
+Your role is to provide actionable, specific feedback to improve trading performance.
 
-DATE: {date}
-TOTAL PNL: ₹{total_pnl}
-TRADES SUMMARY:
-{trades_summary}
-
-DETAILED TRADE LOG:
-{trade_details}
-
-TICK DATA SUMMARY (Last hour):
-{tick_summary}
-
-ANALYSIS INSTRUCTIONS:
+Analysis Framework:
 1. Identify patterns in winning vs losing trades
 2. Check if exits were too early or too late based on subsequent price action
-3. Evaluate entry timing relative to the signals
+3. Evaluate entry timing relative to technical signals
 4. Assess risk management (stop losses, position sizing)
+5. Consider opportunity cost - what happened after exits
 
-Respond in this exact JSON format:
-{{
-    "key_observations": ["<observation1>", "<observation2>", "<observation3>"],
-    "stop_loss_suggestion": "<specific tweak to stop-loss logic, e.g., 'Use 1.5x ATR instead of fixed 1%'>",
-    "overall_assessment": "<1-2 sentence summary of the day's performance>",
-    "improvement_areas": ["<area1>", "<area2>"],
-    "best_trade_analysis": "<why the best trade worked>",
-    "worst_trade_analysis": "<why the worst trade failed>",
-    "exit_timing_verdict": "<GOOD|TOO_EARLY|TOO_LATE|MIXED>"
-}}
+Focus on:
+- Specific, actionable improvements (not generic advice)
+- Quantifiable suggestions (e.g., "Use 1.5x ATR instead of fixed 1%")
+- Pattern recognition across multiple trades
+- Risk-adjusted performance assessment"""
 
-Focus on actionable, specific feedback. No generic advice.
-Return ONLY the JSON, no additional text."""
-
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: str = None, model: str = "gemini-2.5-flash"):
         """
         Initialize the autopsy module.
         
         Args:
-            api_key: Google Gemini API key
+            api_key: Google Gemini API key (or uses GEMINI_API_KEY env var)
             model: Gemini model to use
         """
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model_name = model
         self._setup_client()
         
         self.max_retries = 3
         self.retry_delay = 2.0
+        self.use_thinking_mode = True  # Enable deep reasoning
     
     def _setup_client(self):
         """Configure the Gemini client."""
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(self.model_name)
-        logger.info(f"Post-trade autopsy initialized with {self.model_name}")
+        self.client = genai.Client(api_key=self.api_key)
+        logger.info(f"Post-trade autopsy initialized with {self.model_name} (new SDK + thinking mode)")
     
     def _format_trades_summary(self, trades: List[Dict]) -> str:
         """Format trades for the prompt."""
@@ -158,31 +152,8 @@ Trade #{i}: {trade.get('ticker', 'N/A')}
         
         return "\n".join(summaries) if summaries else "No tick data available."
     
-    def _parse_response(self, response_text: str) -> Dict:
-        """Parse JSON from Gemini response."""
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            pass
-        
-        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-        
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
-        
-        raise ValueError(f"Could not parse JSON from response")
-    
     def analyze(self, trades: List[Dict], tick_data: Dict = None,
-                date: datetime = None) -> AutopsyResult:
+                date: datetime = None, opportunity_cost_data: Dict = None) -> AutopsyResult:
         """
         Perform post-trade autopsy.
         
@@ -219,20 +190,57 @@ Trade #{i}: {trade.get('ticker', 'N/A')}
         best_trade = max(trades, key=lambda x: x.get('pnl', 0)) if trades else {}
         worst_trade = min(trades, key=lambda x: x.get('pnl', 0)) if trades else {}
         
-        # Prepare prompt
-        prompt = self.AUTOPSY_PROMPT.format(
-            date=date.strftime("%Y-%m-%d"),
-            total_pnl=total_pnl,
-            trades_summary=self._format_trades_summary(trades),
-            trade_details=self._format_trade_details(trades),
-            tick_summary=self._format_tick_summary(tick_data or {})
-        )
+        # Build opportunity cost section if available
+        opp_cost_section = ""
+        if opportunity_cost_data:
+            opp_cost_section = "\n\nOPPORTUNITY COST ANALYSIS (Price 2h after exits):\n"
+            for ticker, data in opportunity_cost_data.items():
+                exit_price = data.get('exit_price', 0)
+                price_2h_later = data.get('price_2h_later', 0)
+                change_pct = ((price_2h_later - exit_price) / exit_price * 100) if exit_price > 0 else 0
+                opp_cost_section += f"  {ticker}: Exit ₹{exit_price:.2f} → 2h later ₹{price_2h_later:.2f} ({change_pct:+.2f}%)\n"
         
-        # Call Gemini
+        # Prepare prompt
+        prompt = f"""Review this day's paper trading activity and provide detailed analysis.
+
+DATE: {date.strftime("%Y-%m-%d")}
+TOTAL PNL: ₹{total_pnl:.2f}
+
+TRADES SUMMARY:
+{self._format_trades_summary(trades)}
+
+DETAILED TRADE LOG:
+{self._format_trade_details(trades)}
+
+TICK DATA SUMMARY (Last hour):
+{self._format_tick_summary(tick_data or {})}{opp_cost_section}
+
+Provide your analysis with specific, actionable feedback."""
+        
+        # Call Gemini with thinking mode for deep analysis
         for attempt in range(self.max_retries):
             try:
-                response = self.model.generate_content(prompt)
-                result = self._parse_response(response.text)
+                # Configure thinking mode for complex reasoning
+                config = types.GenerateContentConfig(
+                    system_instruction=self.SYSTEM_INSTRUCTION,
+                    response_mime_type="application/json",
+                    response_schema=AutopsyResponse,
+                )
+                
+                # Enable thinking mode if available (Gemini 2.5+)
+                if self.use_thinking_mode:
+                    config.thinking_config = types.ThinkingConfig(
+                        thinking_budget=1024  # Allow deep reasoning
+                    )
+                
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config
+                )
+                
+                # Parse structured response
+                result = AutopsyResponse.model_validate_json(response.text)
                 
                 return AutopsyResult(
                     date=date,
@@ -242,10 +250,10 @@ Trade #{i}: {trade.get('ticker', 'N/A')}
                     total_pnl=total_pnl,
                     best_trade=best_trade,
                     worst_trade=worst_trade,
-                    key_observations=result.get('key_observations', []),
-                    stop_loss_suggestion=result.get('stop_loss_suggestion', 'No suggestion'),
-                    overall_assessment=result.get('overall_assessment', 'Analysis unavailable'),
-                    improvement_areas=result.get('improvement_areas', [])
+                    key_observations=result.key_observations,
+                    stop_loss_suggestion=result.stop_loss_suggestion,
+                    overall_assessment=result.overall_assessment,
+                    improvement_areas=result.improvement_areas
                 )
                 
             except Exception as e:
@@ -279,7 +287,7 @@ Trade #{i}: {trade.get('ticker', 'N/A')}
 📊 DAILY SUMMARY
 ────────────────────────────────────────────────────────────────────
   Total Trades:    {result.total_trades}
-  Winning Trades:  {result.winning_trades} ({result.winning_trades/result.total_trades*100:.1f}% win rate)
+  Winning Trades:  {result.winning_trades} ({(result.winning_trades/result.total_trades*100) if result.total_trades > 0 else 0:.1f}% win rate)
   Losing Trades:   {result.losing_trades}
   Total PnL:       ₹{result.total_pnl:,.2f}
 

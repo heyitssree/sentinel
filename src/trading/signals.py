@@ -4,9 +4,14 @@ Orchestrates multi-factor entry/exit logic using technical indicators.
 
 This is the "Brain" that combines:
 - 200 EMA trend filter
-- RSI crossover detection (60 for LONG, 40 for SHORT)
-- VWAP execution trigger
+- VWAP Pullback entry (Mean Reversion within Trend) - replaces lagging RSI>60
+- Volume confirmation (institutional backing)
+- Dynamic ATR-based stops
 - Smart Trailing Stop with time-based exit
+
+Updated trading logic based on audit:
+- Entry: Price > 200 EMA + Price within 0.5% of VWAP (pullback) + Volume > 1.5x avg
+- Stops: SL = 2x ATR, TP = 4x ATR (adapts to stock's noise level)
 """
 import pandas as pd
 import numpy as np
@@ -17,6 +22,10 @@ from enum import Enum
 import logging
 
 from src.signals.indicators import TechnicalIndicators
+from config.settings import (
+    VWAP_PULLBACK_THRESHOLD, VOLUME_CONFIRMATION_MULTIPLIER, VOLUME_OVERRIDES,
+    ATR_STOP_LOSS_MULTIPLIER, ATR_TAKE_PROFIT_MULTIPLIER, ATR_PERIOD
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,15 +79,20 @@ class ConfluentSignalEngine:
     """
     Multi-factor confluence engine for trade entry decisions.
     
+    NEW Entry Logic (Mean Reversion Filter):
     Entry Conditions (ALL must be true for LONG):
-    1. Trend: Price > 200 EMA (15-min timeframe)
-    2. Momentum: RSI crosses ABOVE 60
-    3. Execution: Price > VWAP
+    1. Trend: Price > 200 EMA (trend filter)
+    2. VWAP Pullback: Price within 0.5% of VWAP while above (mean reversion)
+    3. Volume: Current volume > 1.5x 20-period average (institutional backing)
     
     For SHORT (inverse):
     1. Price < 200 EMA
-    2. RSI crosses BELOW 40
-    3. Price < VWAP
+    2. Price within 0.5% of VWAP while below
+    3. Volume confirmation
+    
+    Dynamic Stops:
+    - Stop Loss: 2x ATR (adapts to stock's volatility)
+    - Take Profit: 4x ATR (maintains 1:2 RR ratio)
     """
     
     def __init__(
@@ -90,6 +104,10 @@ class ConfluentSignalEngine:
         rsi_short_threshold: float = 40.0,
         rsi_overbought: float = 80.0,
         rsi_oversold: float = 20.0,
+        vwap_pullback_threshold: float = None,
+        volume_multiplier: float = None,
+        atr_sl_multiplier: float = None,
+        atr_tp_multiplier: float = None,
     ):
         self.ema_trend_period = ema_trend_period
         self.ema_trail_period = ema_trail_period
@@ -99,14 +117,21 @@ class ConfluentSignalEngine:
         self.rsi_overbought = rsi_overbought
         self.rsi_oversold = rsi_oversold
         
+        # New Mean Reversion parameters (from settings or overrides)
+        self.vwap_pullback_threshold = vwap_pullback_threshold or VWAP_PULLBACK_THRESHOLD
+        self.volume_multiplier = volume_multiplier or VOLUME_CONFIRMATION_MULTIPLIER
+        self.atr_sl_multiplier = atr_sl_multiplier or ATR_STOP_LOSS_MULTIPLIER
+        self.atr_tp_multiplier = atr_tp_multiplier or ATR_TAKE_PROFIT_MULTIPLIER
+        
         self.indicators = TechnicalIndicators()
         
-        # Track previous RSI for crossover detection
+        # Track previous RSI for crossover detection (kept for backward compat)
         self._prev_rsi: Dict[str, float] = {}
         
         logger.info(
-            f"ConfluentSignalEngine initialized: "
-            f"EMA={ema_trend_period}, RSI thresholds={rsi_long_threshold}/{rsi_short_threshold}"
+            f"ConfluentSignalEngine initialized (Mean Reversion Filter): "
+            f"EMA={ema_trend_period}, VWAP pullback={self.vwap_pullback_threshold:.1%}, "
+            f"Volume>{self.volume_multiplier}x, ATR SL={self.atr_sl_multiplier}x/TP={self.atr_tp_multiplier}x"
         )
     
     def check_confluence(self, df: pd.DataFrame, ticker: str) -> ConfluenceResult:
@@ -180,47 +205,76 @@ class ConfluentSignalEngine:
             'volume_ratio': current_volume_ratio,
         }
         
-        # Check LONG conditions
-        price_above_ema200 = current_price > current_ema_200
-        price_above_vwap = current_price > current_vwap
-        rsi_not_overbought = current_rsi < self.rsi_overbought
+        # =====================================================================
+        # NEW: Mean Reversion Filter Logic (replaces lagging RSI>60)
+        # =====================================================================
         
-        long_conditions = {
-            'price_above_ema200': price_above_ema200,
-            'rsi_crossed_above_60': rsi_crossed_above_60,
-            'rsi_above_60': rsi_above_60,
-            'price_above_vwap': price_above_vwap,
-            'rsi_not_overbought': rsi_not_overbought,
-            'volume_spike': current_volume_ratio > 2.0,
-        }
+        # Get volume threshold for this ticker (per-stock override or global default)
+        volume_threshold = VOLUME_OVERRIDES.get(ticker, self.volume_multiplier)
         
-        # Check SHORT conditions
-        price_below_ema200 = current_price < current_ema_200
-        price_below_vwap = current_price < current_vwap
-        rsi_not_oversold = current_rsi > self.rsi_oversold
-        
-        short_conditions = {
-            'price_below_ema200': price_below_ema200,
-            'rsi_crossed_below_40': rsi_crossed_below_40,
-            'rsi_below_40': rsi_below_40,
-            'price_below_vwap': price_below_vwap,
-            'rsi_not_oversold': rsi_not_oversold,
-        }
-        
-        # Determine signal
-        # LONG: Price > 200 EMA + RSI crosses above 60 + Price > VWAP
-        long_entry = (
-            price_above_ema200 and
-            (rsi_crossed_above_60 or rsi_above_60) and
-            price_above_vwap and
-            rsi_not_overbought
+        # VWAP Pullback Detection: Price within threshold% of VWAP
+        vwap_distance_pct = abs(current_price - current_vwap) / current_vwap if current_vwap > 0 else 1.0
+        vwap_pullback_long = (
+            current_price > current_vwap and  # Price still above VWAP
+            vwap_distance_pct <= self.vwap_pullback_threshold  # But within pullback zone
+        )
+        vwap_pullback_short = (
+            current_price < current_vwap and  # Price still below VWAP
+            vwap_distance_pct <= self.vwap_pullback_threshold  # But within pullback zone
         )
         
-        # SHORT: Price < 200 EMA + RSI crosses below 40 + Price < VWAP
+        # Volume Confirmation: Institutional backing
+        volume_confirmed = current_volume_ratio >= volume_threshold
+        
+        # Trend filters
+        price_above_ema200 = current_price > current_ema_200
+        price_below_ema200 = current_price < current_ema_200
+        rsi_not_overbought = current_rsi < self.rsi_overbought
+        rsi_not_oversold = current_rsi > self.rsi_oversold
+        
+        # Build conditions dict for LONG
+        long_conditions = {
+            'price_above_ema200': price_above_ema200,
+            'vwap_pullback': vwap_pullback_long,
+            'vwap_distance_pct': vwap_distance_pct,
+            'volume_confirmed': volume_confirmed,
+            'volume_ratio': current_volume_ratio,
+            'volume_threshold': volume_threshold,
+            'rsi_not_overbought': rsi_not_overbought,
+            # Legacy (kept for reference)
+            'rsi_crossed_above_60': rsi_crossed_above_60,
+            'rsi_above_60': rsi_above_60,
+        }
+        
+        # Build conditions dict for SHORT
+        short_conditions = {
+            'price_below_ema200': price_below_ema200,
+            'vwap_pullback': vwap_pullback_short,
+            'vwap_distance_pct': vwap_distance_pct,
+            'volume_confirmed': volume_confirmed,
+            'volume_ratio': current_volume_ratio,
+            'rsi_not_oversold': rsi_not_oversold,
+            # Legacy
+            'rsi_crossed_below_40': rsi_crossed_below_40,
+            'rsi_below_40': rsi_below_40,
+        }
+        
+        # =====================================================================
+        # NEW Entry Logic: Mean Reversion Filter
+        # LONG: Price > 200 EMA + VWAP Pullback + Volume Confirmation
+        # =====================================================================
+        long_entry = (
+            price_above_ema200 and      # Trend filter (keep)
+            vwap_pullback_long and      # VWAP pullback (NEW - replaces RSI>60)
+            volume_confirmed and        # Volume gate (NEW - required)
+            rsi_not_overbought          # Safety check
+        )
+        
+        # SHORT: Price < 200 EMA + VWAP Pullback + Volume Confirmation
         short_entry = (
             price_below_ema200 and
-            (rsi_crossed_below_40 or rsi_below_40) and
-            price_below_vwap and
+            vwap_pullback_short and
+            volume_confirmed and
             rsi_not_oversold
         )
         
@@ -228,19 +282,18 @@ class ConfluentSignalEngine:
         if long_entry:
             conditions_met = sum([
                 price_above_ema200,
-                rsi_crossed_above_60 or rsi_above_60,
-                price_above_vwap,
-                current_volume_ratio > 1.5,
+                vwap_pullback_long,
+                volume_confirmed,
+                current_volume_ratio > 2.0,  # Bonus for strong volume
                 current_price > current_ema_20,
             ])
             confidence = conditions_met / 5.0
             
             reason_parts = []
-            reason_parts.append(f"Price > 200 EMA (+{current_price - current_ema_200:.2f})")
-            reason_parts.append(f"RSI={current_rsi:.1f}" + (" [CROSS]" if rsi_crossed_above_60 else ""))
-            reason_parts.append(f"Price > VWAP (+{current_price - current_vwap:.2f})")
-            if current_volume_ratio > 2.0:
-                reason_parts.append(f"Volume spike {current_volume_ratio:.1f}x")
+            reason_parts.append(f"TREND: Price > 200 EMA (+₹{current_price - current_ema_200:.2f})")
+            reason_parts.append(f"VWAP PULLBACK: {vwap_distance_pct:.2%} from VWAP")
+            reason_parts.append(f"VOLUME: {current_volume_ratio:.1f}x (>{volume_threshold}x req)")
+            reason_parts.append(f"RSI: {current_rsi:.1f}")
             
             return ConfluenceResult(
                 is_valid=True,
@@ -254,9 +307,9 @@ class ConfluentSignalEngine:
         elif short_entry:
             conditions_met = sum([
                 price_below_ema200,
-                rsi_crossed_below_40 or rsi_below_40,
-                price_below_vwap,
-                current_volume_ratio > 1.5,
+                vwap_pullback_short,
+                volume_confirmed,
+                current_volume_ratio > 2.0,
             ])
             confidence = conditions_met / 4.0
             
@@ -266,17 +319,20 @@ class ConfluentSignalEngine:
                 confidence=confidence,
                 conditions=short_conditions,
                 indicators=indicators,
-                reason=f"Bearish: Price < 200 EMA, RSI={current_rsi:.1f}, Price < VWAP"
+                reason=f"SHORT: Price < 200 EMA | VWAP pullback {vwap_distance_pct:.2%} | Vol {current_volume_ratio:.1f}x"
             )
         
-        # No valid signal
+        # No valid signal - provide detailed reason for debugging
         missing = []
         if not price_above_ema200:
-            missing.append(f"Price below 200 EMA ({current_price:.2f} < {current_ema_200:.2f})")
-        if not (rsi_crossed_above_60 or rsi_above_60):
-            missing.append(f"RSI not bullish ({current_rsi:.1f} < {self.rsi_long_threshold})")
-        if not price_above_vwap:
-            missing.append(f"Price below VWAP ({current_price:.2f} < {current_vwap:.2f})")
+            missing.append(f"TREND: Price below 200 EMA (₹{current_price:.2f} < ₹{current_ema_200:.2f})")
+        if not vwap_pullback_long:
+            if current_price <= current_vwap:
+                missing.append(f"VWAP: Price below VWAP (₹{current_price:.2f} <= ₹{current_vwap:.2f})")
+            else:
+                missing.append(f"VWAP PULLBACK: Too far from VWAP ({vwap_distance_pct:.2%} > {self.vwap_pullback_threshold:.1%})")
+        if not volume_confirmed:
+            missing.append(f"VOLUME: {current_volume_ratio:.1f}x < {volume_threshold}x required")
         
         return ConfluenceResult(
             is_valid=False,
@@ -300,6 +356,142 @@ class ConfluentSignalEngine:
             SignalType.SHORT_ENTRY
         ]
         return should_audit, result
+    
+    def check_higher_timeframe_trend(self, hourly_df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        Check if higher timeframe (1-hour) confirms the trend direction.
+        
+        Multi-Timeframe Confluence:
+        - Only take LONG on 5-min if 1-hour is also above 200 EMA
+        - Prevents "buying the top" of a minor retracement in a larger downtrend
+        
+        Args:
+            hourly_df: DataFrame with 1-hour OHLCV data
+            
+        Returns:
+            Tuple of (is_bullish, reason)
+        """
+        if hourly_df.empty or len(hourly_df) < 200:
+            return True, "Insufficient 1h data - defaulting to allow"
+        
+        # Ensure sorted
+        hourly_df = hourly_df.sort_values('timestamp').reset_index(drop=True)
+        
+        # Calculate 200 EMA on hourly
+        ema_200 = self.indicators.calculate_ema_200(hourly_df)
+        
+        idx = len(hourly_df) - 1
+        current_price = hourly_df['close'].iloc[idx]
+        current_ema_200 = ema_200.iloc[idx]
+        
+        is_bullish = current_price > current_ema_200
+        
+        if is_bullish:
+            reason = f"1H TREND: Bullish (₹{current_price:.2f} > 200 EMA ₹{current_ema_200:.2f})"
+        else:
+            reason = f"1H TREND: Bearish (₹{current_price:.2f} < 200 EMA ₹{current_ema_200:.2f})"
+        
+        return is_bullish, reason
+    
+    def check_confluence_with_mtf(
+        self, 
+        df_5min: pd.DataFrame, 
+        df_1hour: pd.DataFrame, 
+        ticker: str
+    ) -> ConfluenceResult:
+        """
+        Check confluence with multi-timeframe confirmation.
+        
+        Only allows LONG if both 5-min and 1-hour are bullish.
+        
+        Args:
+            df_5min: 5-minute OHLCV data
+            df_1hour: 1-hour OHLCV data (can be aggregated from 5-min)
+            ticker: Stock ticker
+            
+        Returns:
+            ConfluenceResult with MTF confirmation
+        """
+        # First check 5-min confluence
+        result = self.check_confluence(df_5min, ticker)
+        
+        if not result.is_valid:
+            return result
+        
+        # If 5-min signals LONG, check 1-hour confirmation
+        if result.signal_type == SignalType.LONG_ENTRY:
+            htf_bullish, htf_reason = self.check_higher_timeframe_trend(df_1hour)
+            
+            if not htf_bullish:
+                # Block the trade - higher timeframe is bearish
+                return ConfluenceResult(
+                    is_valid=False,
+                    signal_type=SignalType.NO_SIGNAL,
+                    confidence=0.0,
+                    conditions={**result.conditions, 'htf_confirmed': False},
+                    indicators=result.indicators,
+                    reason=f"MTF BLOCKED: 5-min LONG signal rejected - {htf_reason}"
+                )
+            
+            # Add MTF confirmation to result
+            result.conditions['htf_confirmed'] = True
+            result.reason += f" | {htf_reason}"
+        
+        # For SHORT signals, check if 1-hour is bearish
+        elif result.signal_type == SignalType.SHORT_ENTRY:
+            htf_bullish, htf_reason = self.check_higher_timeframe_trend(df_1hour)
+            
+            if htf_bullish:
+                # Block - higher timeframe is bullish, don't short
+                return ConfluenceResult(
+                    is_valid=False,
+                    signal_type=SignalType.NO_SIGNAL,
+                    confidence=0.0,
+                    conditions={**result.conditions, 'htf_confirmed': False},
+                    indicators=result.indicators,
+                    reason=f"MTF BLOCKED: 5-min SHORT signal rejected - {htf_reason}"
+                )
+            
+            result.conditions['htf_confirmed'] = True
+            result.reason += f" | {htf_reason}"
+        
+        return result
+    
+    def calculate_dynamic_stops(
+        self, 
+        entry_price: float, 
+        atr: float, 
+        side: str
+    ) -> Tuple[float, float]:
+        """
+        Calculate dynamic ATR-based stop loss and take profit.
+        
+        Adapts to stock's current volatility (noise level):
+        - High-beta stocks get wider stops
+        - Low-beta stocks get tighter stops
+        
+        Args:
+            entry_price: Entry price
+            atr: Current ATR value
+            side: "BUY" or "SELL"
+            
+        Returns:
+            Tuple of (stop_loss, take_profit)
+        """
+        if side == "BUY":
+            stop_loss = entry_price - (atr * self.atr_sl_multiplier)
+            take_profit = entry_price + (atr * self.atr_tp_multiplier)
+        else:  # SELL/SHORT
+            stop_loss = entry_price + (atr * self.atr_sl_multiplier)
+            take_profit = entry_price - (atr * self.atr_tp_multiplier)
+        
+        logger.debug(
+            f"Dynamic stops: Entry={entry_price:.2f}, ATR={atr:.2f}, "
+            f"SL={stop_loss:.2f} ({self.atr_sl_multiplier}x), "
+            f"TP={take_profit:.2f} ({self.atr_tp_multiplier}x)"
+        )
+        
+        return stop_loss, take_profit
 
 
 class SmartTrailingStop:

@@ -9,6 +9,7 @@ Includes:
 """
 import duckdb
 import pandas as pd
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable
@@ -651,17 +652,175 @@ class SentinelDB:
         """, [ticker, interval]).fetchone()
         return result[0] if result else 0
     
+    def aggregate_to_hourly(self, ticker: str, since: datetime = None) -> pd.DataFrame:
+        """
+        Aggregate 5-minute candles to 1-hour candles for multi-timeframe analysis.
+        
+        This ensures data integrity by using the same raw data source for both
+        5-min entry signals and 1-hour trend confirmation.
+        
+        Args:
+            ticker: Stock ticker
+            since: Start time (default: last 24 hours)
+            
+        Returns:
+            DataFrame with 1-hour OHLCV candles
+        """
+        if since is None:
+            since = datetime.now() - timedelta(hours=24)
+        
+        result = self.conn.execute("""
+            WITH hourly_buckets AS (
+                SELECT 
+                    ticker,
+                    time_bucket(INTERVAL '1 hour', timestamp) as bucket,
+                    FIRST(open ORDER BY timestamp) as open,
+                    MAX(high) as high,
+                    MIN(low) as low,
+                    LAST(close ORDER BY timestamp) as close,
+                    SUM(volume) as volume,
+                    AVG(vwap) as vwap
+                FROM candles
+                WHERE ticker = ? 
+                  AND timestamp >= ?
+                  AND (interval = '5min' OR interval = '1min' OR interval IS NULL)
+                GROUP BY ticker, bucket
+            )
+            SELECT * FROM hourly_buckets 
+            ORDER BY bucket ASC
+        """, [ticker, since]).df()
+        
+        if not result.empty:
+            result = result.rename(columns={'bucket': 'timestamp'})
+        
+        return result
+    
+    def get_hourly_candles(self, ticker: str, limit: int = 250) -> pd.DataFrame:
+        """
+        Get or generate 1-hour candles for higher timeframe analysis.
+        
+        First checks for stored 1-hour candles, then aggregates from 5-min if needed.
+        
+        Args:
+            ticker: Stock ticker
+            limit: Maximum candles to return
+            
+        Returns:
+            DataFrame with 1-hour candles sorted by timestamp ascending
+        """
+        # First try to get stored 1-hour candles
+        stored = self.conn.execute("""
+            SELECT ticker, timestamp, open, high, low, close, volume, vwap
+            FROM candles 
+            WHERE ticker = ? AND interval = '1hour'
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, [ticker, limit]).df()
+        
+        if not stored.empty and len(stored) >= 200:
+            return stored.sort_values('timestamp').reset_index(drop=True)
+        
+        # Aggregate from 5-min candles
+        hours_needed = limit  # 1 hour = 12 x 5min candles
+        since = datetime.now() - timedelta(hours=hours_needed)
+        
+        aggregated = self.aggregate_to_hourly(ticker, since)
+        
+        if aggregated.empty:
+            return stored.sort_values('timestamp').reset_index(drop=True) if not stored.empty else pd.DataFrame()
+        
+        return aggregated.tail(limit).reset_index(drop=True)
+    
+    def vacuum_old_data(self, days: int = 7) -> Dict[str, int]:
+        """
+        Remove old data beyond retention period and vacuum database.
+        
+        This is essential for preventing unbounded DB growth when storing
+        ticks for 20+ stocks continuously.
+        
+        Args:
+            days: Number of days to retain (default 7)
+            
+        Returns:
+            Dict with counts of deleted records per table
+        """
+        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = cutoff.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        results = {'ticks': 0, 'candles_1min': 0, 'news': 0}
+        
+        # Delete old ticks (most aggressive cleanup)
+        tick_result = self.conn.execute("""
+            DELETE FROM ticks WHERE timestamp < ?
+            RETURNING *
+        """, [cutoff]).fetchall()
+        results['ticks'] = len(tick_result)
+        
+        # Delete old 1-minute candles (keep 5min+ for longer analysis)
+        candle_result = self.conn.execute("""
+            DELETE FROM candles 
+            WHERE timestamp < ? AND (interval = '1min' OR interval IS NULL)
+            RETURNING *
+        """, [cutoff]).fetchall()
+        results['candles_1min'] = len(candle_result)
+        
+        # Delete old news (older than retention period)
+        news_result = self.conn.execute("""
+            DELETE FROM news WHERE timestamp < ?
+            RETURNING *
+        """, [cutoff]).fetchall()
+        results['news'] = len(news_result)
+        
+        # Vacuum the database to reclaim space
+        self.conn.execute("VACUUM")
+        
+        total_deleted = sum(results.values())
+        if total_deleted > 0:
+            logger.info(f"Data retention cleanup: deleted {results['ticks']} ticks, "
+                       f"{results['candles_1min']} 1min candles, {results['news']} news items. "
+                       f"Retention period: {days} days")
+        
+        return results
+    
+    def get_database_stats(self) -> Dict[str, Any]:
+        """Get database size and record counts for monitoring."""
+        stats = {}
+        
+        # Record counts per table
+        for table in ['ticks', 'candles', 'news', 'trades', 'positions']:
+            try:
+                result = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                stats[f'{table}_count'] = result[0] if result else 0
+            except Exception:
+                stats[f'{table}_count'] = 0
+        
+        # Database file size
+        try:
+            db_path = Path(self.db_path)
+            if db_path.exists():
+                stats['db_size_mb'] = db_path.stat().st_size / (1024 * 1024)
+            else:
+                stats['db_size_mb'] = 0
+        except Exception:
+            stats['db_size_mb'] = 0
+        
+        return stats
+    
     def close(self):
         """Close database connection."""
         self.conn.close()
 
 
-# Singleton instance
+# Singleton instance with thread-safe initialization
 _db_instance: Optional[SentinelDB] = None
+_db_lock = threading.Lock()
 
 def get_db(db_path: str = "data/sentinel.duckdb") -> SentinelDB:
-    """Get or create the database instance."""
+    """Get or create the database instance (thread-safe)."""
     global _db_instance
     if _db_instance is None:
-        _db_instance = SentinelDB(db_path)
+        with _db_lock:
+            # Double-check locking pattern
+            if _db_instance is None:
+                _db_instance = SentinelDB(db_path)
     return _db_instance

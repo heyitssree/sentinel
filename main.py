@@ -9,8 +9,10 @@ import sys
 import time
 import signal
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -76,9 +78,13 @@ class Sentinel:
         self._init_analyzers()
         self._init_trading()
         
-        # Candle aggregation
+        # Candle aggregation with thread-safe access
         self._candle_data = {ticker: [] for ticker in WATCHLIST}
         self._last_candle_time = {ticker: None for ticker in WATCHLIST}
+        self._candle_lock = threading.Lock()  # Protects _candle_data and _last_candle_time
+        
+        # ThreadPoolExecutor for parallel ticker analysis
+        self._executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="sentinel_analysis")
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -178,7 +184,7 @@ class Sentinel:
             self._aggregate_tick(symbol, tick)
     
     def _aggregate_tick(self, symbol: str, tick: dict):
-        """Aggregate tick data into candles."""
+        """Aggregate tick data into candles. Thread-safe."""
         now = datetime.now()
         candle_start = now.replace(
             minute=(now.minute // 5) * 5,
@@ -186,25 +192,26 @@ class Sentinel:
             microsecond=0
         )
         
-        if self._last_candle_time.get(symbol) != candle_start:
-            # New candle period
-            if self._candle_data[symbol]:
-                # Save previous candle
-                self._save_candle(symbol)
+        with self._candle_lock:
+            if self._last_candle_time.get(symbol) != candle_start:
+                # New candle period
+                if self._candle_data[symbol]:
+                    # Save previous candle (lock already held)
+                    self._save_candle_locked(symbol)
+                
+                # Start new candle
+                self._candle_data[symbol] = []
+                self._last_candle_time[symbol] = candle_start
             
-            # Start new candle
-            self._candle_data[symbol] = []
-            self._last_candle_time[symbol] = candle_start
-        
-        # Add tick to current candle
-        self._candle_data[symbol].append({
-            'price': tick['last_price'],
-            'volume': tick.get('last_traded_quantity', 0),
-            'timestamp': now
-        })
+            # Add tick to current candle
+            self._candle_data[symbol].append({
+                'price': tick['last_price'],
+                'volume': tick.get('last_traded_quantity', 0),
+                'timestamp': now
+            })
     
-    def _save_candle(self, symbol: str):
-        """Save aggregated candle to database."""
+    def _save_candle_locked(self, symbol: str):
+        """Save aggregated candle to database. Must be called with _candle_lock held."""
         ticks = self._candle_data[symbol]
         if not ticks:
             return
@@ -228,6 +235,11 @@ class Sentinel:
         candle['vwap'] = total_pv / total_vol if total_vol > 0 else prices[-1]
         
         self.db.insert_candle(**candle)
+    
+    def _save_candle(self, symbol: str):
+        """Save aggregated candle to database. Thread-safe wrapper."""
+        with self._candle_lock:
+            self._save_candle_locked(symbol)
     
     def _fetch_news(self, ticker: str):
         """Fetch and store news for a ticker."""
@@ -351,17 +363,29 @@ class Sentinel:
             self.executor.close_all_trades("End of Day Square Off")
             return False
         
-        # Process each ticker
-        for ticker in WATCHLIST:
+        # Process tickers in parallel using ThreadPoolExecutor
+        # This prevents slow Gemini API calls from blocking other ticker analysis
+        def process_ticker(ticker: str) -> tuple:
+            """Process a single ticker (news + analysis). Returns (ticker, success, error)."""
             try:
-                # Fetch news
                 self._fetch_news(ticker)
-                
-                # Run analysis
-                self._analyze_ticker(ticker)
-                
+                trade_executed = self._analyze_ticker(ticker)
+                return (ticker, True, trade_executed)
             except Exception as e:
-                logger.error(f"Error processing {ticker}: {e}")
+                return (ticker, False, str(e))
+        
+        # Submit all ticker tasks to the thread pool
+        futures = {self._executor.submit(process_ticker, ticker): ticker for ticker in WATCHLIST}
+        
+        # Collect results with timeout to prevent indefinite blocking
+        for future in as_completed(futures, timeout=60):
+            ticker = futures[future]
+            try:
+                ticker_name, success, result = future.result(timeout=10)
+                if not success:
+                    logger.error(f"Error processing {ticker_name}: {result}")
+            except Exception as e:
+                logger.error(f"Ticker {ticker} processing failed: {e}")
         
         # Check stop loss / take profit for all positions
         self.executor.check_stop_loss_take_profit()
@@ -447,6 +471,10 @@ class Sentinel:
         logger.info("🛑 Initiating shutdown...")
         
         self._running = False
+        
+        # Shutdown thread pool executor
+        logger.info("Shutting down thread pool...")
+        self._executor.shutdown(wait=True, cancel_futures=True)
         
         # Close all positions
         if self.executor.get_active_trades():

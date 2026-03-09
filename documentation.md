@@ -4,6 +4,71 @@ A high-availability paper trading pipeline integrating Zerodha (mock), DuckDB, a
 
 ---
 
+## Phase 3 Implementation Summary (Mar 9, 2026 - Audit Refinements)
+
+### Completed Changes
+
+| Phase | Component | File | Description |
+|-------|-----------|------|-------------|
+| **0** | SDK Upgrade | `requirements.txt` | Migrated to `google-genai[aiohttp]` (replaces legacy SDK) |
+| **0** | Pydantic Models | `src/gemini/models.py` | Structured outputs for all Gemini responses |
+| **0** | Async Sentiment | `src/gemini/sentiment.py` | Async client + Pydantic schema (no JSON parsing) |
+| **0** | Thinking Mode | `src/gemini/autopsy.py` | Deep reasoning for complex trade analysis |
+| **0** | Technical Analyst | `src/gemini/technical_analyst.py` | Async + structured outputs |
+| **1** | Thread Safety | `main.py` | `threading.Lock()` for `_candle_data` access |
+| **1** | Parallel Processing | `main.py` | `ThreadPoolExecutor` for ticker analysis |
+| **1** | SSL Security | `src/api/server.py` | SSL bypass only in dev mode (`SENTINEL_DEV_MODE=true`) |
+| **1** | Data Retention | `src/storage/db.py` | `vacuum_old_data(days=7)` method |
+| **2** | VWAP Pullback | `src/trading/signals.py` | Mean Reversion Filter (replaces RSI>60) |
+| **2** | Volume Gate | `src/trading/signals.py` | 1.5x volume confirmation required |
+| **2** | ATR Stops | `src/trading/signals.py` | Dynamic SL=2×ATR, TP=4×ATR |
+| **3** | MTF Confluence | `src/trading/signals.py` | 1-hour trend confirmation for 5-min signals |
+| **3** | Hourly Aggregation | `src/storage/db.py` | `aggregate_to_hourly()` from 5-min data |
+| **3** | Regime Detection | `src/gemini/regime_detector.py` | TRENDING_UP/DOWN/CHOPPY classification |
+| **3** | Kill Switch Integration | `src/trading/risk.py` | Regime multiplier (50% in CHOPPY) |
+
+### New Trading Logic: Mean Reversion Filter
+
+**OLD (Lagging):**
+```
+Entry: Price > 200 EMA + RSI > 60 + Price > VWAP
+```
+
+**NEW (Improved RR):**
+```
+Entry: Price > 200 EMA + VWAP Pullback (within 0.5%) + Volume > 1.5x avg
+Stops: SL = 2×ATR, TP = 4×ATR (adapts to stock volatility)
+```
+
+### New Settings (`config/settings.py`)
+
+```python
+# Mean Reversion Filter
+VWAP_PULLBACK_THRESHOLD = 0.005  # 0.5% buffer zone
+VOLUME_CONFIRMATION_MULTIPLIER = 1.5
+VOLUME_OVERRIDES = {}  # Per-stock: "RELIANCE:1.2,TCS:2.0"
+
+# Dynamic ATR Stops
+ATR_STOP_LOSS_MULTIPLIER = 2.0
+ATR_TAKE_PROFIT_MULTIPLIER = 4.0
+
+# Database
+DATA_RETENTION_DAYS = 7
+```
+
+### Regime Detection Timing
+
+- **9:20 AM IST** - First check (after opening volatility settles)
+- **Every 30 min** - Subsequent checks
+
+### Kill Switch Regime Integration
+
+When CHOPPY regime detected:
+- `DEFAULT_QUANTITY` reduced by 50%
+- Kill switch limit reduced by 50% (₹5000 → ₹2500)
+
+---
+
 ## Phase 2 Implementation Summary (Mar 9, 2026)
 
 ### Completed Features
@@ -364,3 +429,52 @@ RISK_PER_TRADE=500              # ₹500 risk per trade
 - 20 EMA: #ff6b35 (orange)
 - 9 EMA: #00f5d4 (cyan - trailing)
 - VWAP: #4361ee (blue dashed)
+
+---
+
+## Security & Stability Audit (Mar 10, 2026)
+
+### Critical Fixes Applied
+
+| ID | Issue | File | Fix |
+|----|-------|------|-----|
+| **C1** | SSL verification disabled globally | `news_scraper.py` | Replaced global bypass with certifi-based secure SSL context |
+| **C2** | Division by zero in autopsy | `autopsy.py` | Added zero-check guard for win rate calculation |
+
+### High Priority Fixes Applied
+
+| ID | Issue | File | Fix |
+|----|-------|------|-----|
+| **H3** | Stale `self.model` reference | `vision.py` | Updated to use `self.client.models.generate_content()` |
+| **H4** | Race condition in news cache | `news_scraper.py` | Protected global cache with `_cache_lock` |
+| **H5** | Silent WebSocket errors | `server.py` | Added logging and dead connection cleanup |
+| **H6** | Method name mismatch | `server.py` | Fixed `close_trade` → `exit_by_ticker` |
+
+### Medium Priority Fixes Applied
+
+| ID | Issue | File | Fix |
+|----|-------|------|-----|
+| **M1** | `ENV_FILE` undefined before use | `server.py` | Moved definition to top of file |
+| **M4** | CORS wildcard security | `server.py` | Made configurable via `ALLOWED_ORIGINS` env var |
+| **M5** | No ticker input validation | `server.py` | Added `validate_ticker()` with regex pattern |
+| **M6** | Thread-unsafe DB singleton | `db.py` | Added double-check locking with `threading.Lock` |
+
+### AI Safety Fix
+
+| ID | Issue | File | Fix |
+|----|-------|------|-----|
+| **A2** | No confidence threshold | `vision.py` | Added `min_confidence=0.6` parameter to `is_safe_to_enter()` |
+
+### Low Priority Fix
+
+| ID | Issue | File | Fix |
+|----|-------|------|-----|
+| **L1** | Deprecated `np.bool8` | `server.py` | Removed from type check |
+
+### Verification
+- ✅ All modified files compile successfully
+- ✅ Core module imports verified
+- ✅ No functionality removed
+
+### Detailed Plan
+See `plan.md` for full audit findings and remaining items.

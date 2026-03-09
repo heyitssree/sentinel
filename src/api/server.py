@@ -1,17 +1,34 @@
 """
 FastAPI server for The Sentinel Web Dashboard.
 Provides REST API and WebSocket for real-time updates.
+
+SSL Security:
+- Uses certifi certificates by default (secure)
+- SSL bypass only enabled in development mode via SENTINEL_DEV_MODE=true
+- Production deployments should NEVER set SENTINEL_DEV_MODE=true
 """
-# SSL certificate fix for macOS - MUST be before any other imports
 import os
 import ssl
 import certifi
+
+# Configure SSL certificates properly (secure by default)
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
-try:
-    ssl._create_default_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
+
+# ONLY bypass SSL verification in explicit development mode
+# WARNING: Never enable this in production - vulnerable to MITM attacks
+_DEV_MODE = os.getenv('SENTINEL_DEV_MODE', 'false').lower() == 'true'
+if _DEV_MODE:
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+        import warnings
+        warnings.warn(
+            "SSL verification disabled (SENTINEL_DEV_MODE=true). "
+            "DO NOT use in production!", 
+            UserWarning
+        )
+    except AttributeError:
+        pass
 
 import asyncio
 import json
@@ -63,6 +80,25 @@ from src.ingestion.news_scraper import NewsScraper, MockNewsScraper
 import numpy as np
 import pandas as pd
 
+# Environment file path - defined early as it's used in multiple endpoints
+ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+
+
+import re
+
+# Ticker validation pattern - uppercase letters only, 1-20 chars
+_TICKER_PATTERN = re.compile(r'^[A-Z]{1,20}$')
+
+def validate_ticker(ticker: str) -> str:
+    """Validate and normalize ticker symbol. Raises HTTPException if invalid."""
+    ticker = ticker.upper().strip()
+    if not _TICKER_PATTERN.match(ticker):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid ticker symbol: {ticker}. Must be 1-20 uppercase letters."
+        )
+    return ticker
+
 
 def sanitize_for_json(obj):
     """
@@ -73,7 +109,7 @@ def sanitize_for_json(obj):
         return {k: sanitize_for_json(v) for k, v in obj.items()}
     elif isinstance(obj, (list, tuple)):
         return [sanitize_for_json(item) for item in obj]
-    elif isinstance(obj, (np.bool_, np.bool8)):
+    elif isinstance(obj, np.bool_):
         return bool(obj)
     elif isinstance(obj, (np.integer, np.int64, np.int32)):
         return int(obj)
@@ -105,11 +141,20 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
     
     async def broadcast(self, message: dict):
+        """Broadcast message to all connected clients, removing dead connections."""
+        dead_connections = []
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except:
-                pass
+            except WebSocketDisconnect:
+                dead_connections.append(connection)
+            except Exception as e:
+                logger.warning(f"WebSocket broadcast error: {e}")
+                dead_connections.append(connection)
+        
+        # Clean up dead connections
+        for conn in dead_connections:
+            self.disconnect(conn)
 
 
 class SentinelEngine:
@@ -483,9 +528,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# CORS Configuration - use environment variable for production
+# Default allows all for development; set ALLOWED_ORIGINS in production
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+if _allowed_origins == ["*"]:
+    logger.warning("CORS: Allowing all origins (set ALLOWED_ORIGINS env var for production)")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1227,17 +1278,18 @@ async def execute_trade(request: TradeRequest):
 @app.post("/api/close/{ticker}")
 async def close_position(ticker: str):
     """Close position for a ticker."""
-    if ticker not in WATCHLIST:
+    if ticker not in engine.get_watchlist():
         raise HTTPException(status_code=400, detail=f"Ticker {ticker} not in watchlist")
     
-    closed = engine.executor.close_trade(ticker, reason="Manual close from dashboard")
+    # Use correct method name: exit_by_ticker instead of close_trade
+    exits = engine.executor.exit_by_ticker(ticker, reason="Manual close from dashboard")
     
-    if closed:
+    if exits:
         await manager.broadcast({
             "type": "position_closed",
-            "data": {"ticker": ticker}
+            "data": {"ticker": ticker, "exits": len(exits)}
         })
-        return {"success": True, "ticker": ticker}
+        return {"success": True, "ticker": ticker, "trades_closed": len(exits)}
     
     raise HTTPException(status_code=404, detail=f"No open position for {ticker}")
 
@@ -1286,7 +1338,7 @@ async def get_chart(ticker: str):
 
 
 # Connection Testing & Credential Management
-ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+# (ENV_FILE is defined at top of file)
 
 
 @app.get("/api/credentials/status")

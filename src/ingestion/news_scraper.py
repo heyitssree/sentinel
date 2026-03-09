@@ -6,12 +6,14 @@ Filters headlines by stock ticker keywords.
 Features:
 - TTL-based caching (default 120 seconds) to reduce API calls
 - Configurable via NEWS_CACHE_TTL environment variable
+- Secure SSL handling with certifi certificates
 """
 import feedparser
 import re
 import ssl
 import urllib.request
 import os
+import certifi
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Set
 import logging
@@ -19,13 +21,20 @@ import time
 from dataclasses import dataclass, field
 from threading import Lock
 
-# Fix SSL certificate issues on macOS
-try:
-    _create_unverified_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
-else:
-    ssl._create_default_https_context = _create_unverified_https_context
+# Configure SSL context securely using certifi certificates
+# This is scoped to feedparser requests only, not global
+def _get_secure_ssl_context():
+    """Create a secure SSL context using certifi certificates."""
+    try:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        return ctx
+    except Exception:
+        # Fallback: use default context if certifi fails
+        return ssl.create_default_context()
+
+# Configure feedparser to use secure SSL
+# Note: feedparser uses urllib internally, so we set handlers for it
+_ssl_context = _get_secure_ssl_context()
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +163,9 @@ class NewsScraper:
             List of NewsItem objects
         """
         try:
-            feed = feedparser.parse(url)
+            # Use secure SSL context via urllib handler
+            handlers = [urllib.request.HTTPSHandler(context=_ssl_context)]
+            feed = feedparser.parse(url, handlers=handlers)
             
             if feed.bozo and feed.bozo_exception:
                 logger.warning(f"Feed parsing warning for {source_name}: {feed.bozo_exception}")
@@ -245,10 +256,11 @@ class NewsScraper:
         # Sort by timestamp (newest first)
         all_items.sort(key=lambda x: x.timestamp, reverse=True)
         
-        # Update global cache
-        if all_items:
-            self._all_news_cache = all_items
-            self._all_news_cache_time = datetime.now()
+        # Update global cache with thread safety
+        with self._cache_lock:
+            if all_items:
+                self._all_news_cache = all_items
+                self._all_news_cache_time = datetime.now()
         
         logger.info(f"Fetched {len(all_items)} relevant news items")
         return all_items
