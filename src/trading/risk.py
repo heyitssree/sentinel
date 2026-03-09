@@ -292,6 +292,8 @@ class HybridKillSwitch:
             'user_limit_percent': self._user_limit_percent,
             'user_limit_amount': self._user_limit_amount,
             'effective_limit': self._effective_limit,
+            'regime_multiplier': self._regime_multiplier,
+            'regime_adjusted_limit': self._regime_adjusted_limit,
         }
 
 
