@@ -200,14 +200,23 @@ function App() {
   // Control engine
   const controlEngine = async (action) => {
     try {
-      await fetch(`${API_BASE}/control`, {
+      console.log(`Engine control: ${action}`);
+      const response = await fetch(`${API_BASE}/control`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action })
       });
+      const result = await response.json();
+      console.log(`Engine control result:`, result);
+      if (!response.ok) {
+        showToast('Error', result.detail || 'Failed to control engine', 'error');
+      } else {
+        showToast('Success', `Engine ${action} successful`, 'success');
+      }
       fetchData();
     } catch (error) {
       console.error('Error controlling engine:', error);
+      showToast('Error', `Failed to ${action} engine: ${error.message}`, 'error');
     }
   };
 
