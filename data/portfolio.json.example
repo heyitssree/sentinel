@@ -1,0 +1,15 @@
+{
+  "starting_capital": 100000.0,
+  "available_cash": 100000.0,
+  "watchlist": [
+    "RELIANCE",
+    "TCS",
+    "HDFCBANK",
+    "ICICIBANK",
+    "INFY"
+  ],
+  "realized_pnl": 0.0,
+  "total_trades": 0,
+  "winning_trades": 0,
+  "holdings": {}
+}
