@@ -947,8 +947,6 @@ async def get_chart_data(ticker: str, interval: str = "5min", limit: int = 100):
                 })
         return result
     
-    import pandas as pd
-    
     return sanitize_for_json({
         "ticker": ticker,
         "interval": interval,

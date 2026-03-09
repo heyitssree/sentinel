@@ -242,11 +242,11 @@ function App() {
     const ticker = customTicker.trim().toUpperCase();
     if (!ticker) return;
     if (ticker.length < 2 || ticker.length > 20) {
-      alert('Ticker must be 2-20 characters');
+      showToast('Invalid Ticker', 'Ticker must be 2-20 characters', 'error');
       return;
     }
     if (status?.watchlist?.includes(ticker)) {
-      alert(`${ticker} is already in watchlist`);
+      showToast('Duplicate', `${ticker} is already in watchlist`, 'warning');
       return;
     }
     await addToWatchlist(ticker);
@@ -257,7 +257,7 @@ function App() {
   const setCapital = async () => {
     const amount = parseFloat(capitalInput);
     if (isNaN(amount) || amount < 10000) {
-      alert('Minimum capital is ₹10,000');
+      showToast('Invalid Amount', 'Minimum capital is ₹10,000', 'error');
       return;
     }
     try {
@@ -332,7 +332,7 @@ function App() {
       if (data.success) {
         setGeminiKey('');
         fetchCredentials();
-        alert('Gemini API key updated successfully');
+        showToast('Success', 'Gemini API key updated successfully', 'success');
       }
     } catch (error) {
       console.error('Error updating Gemini key:', error);
@@ -357,7 +357,7 @@ function App() {
         setZerodhaKey('');
         setZerodhaSecret('');
         fetchCredentials();
-        alert('Zerodha credentials updated successfully');
+        showToast('Success', 'Zerodha credentials updated successfully', 'success');
       }
     } catch (error) {
       console.error('Error updating Zerodha credentials:', error);
@@ -861,8 +861,7 @@ function App() {
         <DailyAutopsy isVisible={activeView === 'autopsy'} />
       </div>
 
-      {activeView === 'dashboard' && (
-        <>
+      <div style={{ display: activeView === 'dashboard' ? 'block' : 'none' }}>
           {/* Portfolio Overview */}
           <div className="bg-gradient-to-r from-blue-900/50 to-purple-900/50 rounded-xl p-4 mb-6 border border-blue-500/30">
             <div className="flex items-center justify-between">
@@ -891,8 +890,8 @@ function App() {
             </div>
           </div>
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+          {/* Stats Cards */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard
           title="Realized P&L"
           value={`₹${(status?.portfolio?.realized_pnl || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`}
@@ -1080,8 +1079,7 @@ function App() {
           </div>
         </div>
       </div>
-        </>
-      )}
+      </div>
 
       {/* Footer */}
       <footer className="mt-8 text-center text-gray-500 text-sm">
