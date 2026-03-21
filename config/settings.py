@@ -41,7 +41,14 @@ BASE_PRICES = {
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", 0.0005))  # 0.05%
 MTM_LOSS_LIMIT = float(os.getenv("MTM_LOSS_LIMIT", 5000))  # ₹5,000 kill switch
 MAX_ORDERS_PER_SECOND = 10  # SEBI 2026 compliance
-DEFAULT_QUANTITY = 10  # Shares per trade
+DEFAULT_QUANTITY = 10  # Shares per trade (fallback if ATR sizing unavailable)
+
+# Risk per trade in INR — used by ATR-based position sizing
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 500))
+
+# Take-profit and stop-loss percentages (used by SmartTrailingStop breakeven/trail thresholds)
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", 0.02))   # 2% profit → start trailing
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", 0.01))        # 1% profit → move to breakeven
 
 # =============================================================================
 # Signal Thresholds

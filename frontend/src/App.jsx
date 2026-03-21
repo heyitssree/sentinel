@@ -1,17 +1,20 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { 
-  Shield, Activity, TrendingUp, TrendingDown, DollarSign, 
+import {
+  Shield, Activity, TrendingUp, TrendingDown, DollarSign,
   AlertTriangle, Play, Square, Zap, BarChart3, Newspaper,
-  RefreshCw, XCircle, CheckCircle, Clock, Plus, Minus, 
+  RefreshCw, XCircle, CheckCircle, Clock, Plus, Minus,
   Wallet, PieChart, Settings, RotateCcw, Key, Loader2, Eye, EyeOff,
-  LayoutGrid, Brain, FileText, CandlestickChart
+  LayoutGrid, Brain, FileText, CandlestickChart, Sparkles, ToggleLeft, ToggleRight,
+  SlidersHorizontal
 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
+import { Toaster, toast } from 'sonner';
 
 import AIReasoningPanel from './components/AIReasoningPanel';
 import TechnicalHeatmap from './components/TechnicalHeatmap';
 import TradingChart from './components/TradingChart';
 import DailyAutopsy from './components/DailyAutopsy';
+import WatchlistSuggestions from './components/WatchlistSuggestions';
 
 const API_BASE = '/api';
 
@@ -27,9 +30,14 @@ function App() {
   const [availableStocks, setAvailableStocks] = useState([]);
   const [capitalInput, setCapitalInput] = useState('');
   const [customTicker, setCustomTicker] = useState('');
-  const [activeView, setActiveView] = useState('dashboard'); // dashboard, heatmap, chart, autopsy
+  const [activeView, setActiveView] = useState('dashboard'); // dashboard, heatmap, chart, autopsy, suggestions
   const [chartData, setChartData] = useState({ candles: [], indicators: {} });
   const [tradingPhase, setTradingPhase] = useState(null);
+  const [tradingMode, setTradingMode] = useState('paper'); // "paper" | "live"
+  const [switchingMode, setSwitchingMode] = useState(false);
+  const [suggestionsNewCount, setSuggestionsNewCount] = useState(0); // badge
+  const [riskSettings, setRiskSettings] = useState(null);
+  const [showRiskSettings, setShowRiskSettings] = useState(false);
   
   // Credentials state
   const [credentials, setCredentials] = useState(null);
@@ -98,16 +106,74 @@ function App() {
     }
   }, []);
 
+  // Fetch trading mode
+  const fetchTradingMode = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/trading-mode`);
+      const data = await res.json();
+      setTradingMode(data.mode);
+    } catch (e) { /* ignore */ }
+  }, []);
+
+  // Switch paper ↔ live
+  const switchTradingMode = async () => {
+    const targetMode = tradingMode === 'paper' ? 'live' : 'paper';
+    if (targetMode === 'live') {
+      if (!window.confirm(
+        '⚠️ Switch to LIVE mode?\n\nThis will place REAL orders with REAL money on Zerodha.\nMake sure your credentials are correct and the engine is properly configured.'
+      )) return;
+    }
+    setSwitchingMode(true);
+    try {
+      const res = await fetch(`${API_BASE}/trading-mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: targetMode }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setTradingMode(data.mode);
+        toast.success(`Switched to ${data.mode.toUpperCase()} mode`);
+      } else {
+        toast.error(data.detail || 'Mode switch failed');
+      }
+    } catch (e) {
+      toast.error('Mode switch failed: ' + e.message);
+    }
+    setSwitchingMode(false);
+  };
+
+  // Fetch risk settings
+  const fetchRiskSettings = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/settings/risk`);
+      setRiskSettings(await res.json());
+    } catch (e) { /* ignore */ }
+  }, []);
+
+  // Add stock to watchlist (used by suggestions)
+  const addToWatchlistByTicker = useCallback(async (ticker) => {
+    await addToWatchlist(ticker);
+    toast.success(`${ticker} added to watchlist`);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // WebSocket connection
   useEffect(() => {
     fetchData();
-    
-    const ws = new WebSocket(`ws://${window.location.hostname}:8000/ws`);
-    
+    fetchTradingMode();
+
+    // Use relative WebSocket URL — works behind any proxy/port
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsHost = window.location.host.includes(':5173')
+      ? `${window.location.hostname}:8000`  // Vite dev server — backend on 8000
+      : window.location.host;
+    const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws`);
+
     ws.onopen = () => setWsConnected(true);
     ws.onclose = () => setWsConnected(false);
     ws.onerror = () => setWsConnected(false);
-    
+
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === 'tick') {
@@ -115,20 +181,42 @@ function App() {
           ...prev,
           prices: data.prices,
           stats: data.stats,
-          running: data.running
+          running: data.running,
         }));
-      } else if (data.type === 'trade_executed' || data.type === 'position_closed') {
+      } else if (data.type === 'trade_executed') {
+        fetchData();
+        const d = data.data || {};
+        toast.success(
+          `${d.mode === 'live' ? '🔴 LIVE' : '📄 Paper'} Trade: ${d.side} ${d.quantity} ${d.ticker} @ ₹${d.price?.toFixed(2)}`,
+          { duration: 6000 }
+        );
+      } else if (data.type === 'position_closed') {
+        fetchData();
+        const d = data.data || {};
+        const pnl = d.pnl || 0;
+        if (pnl >= 0) {
+          toast.success(`✅ ${d.ticker} closed +₹${pnl.toFixed(2)} — ${d.reason || ''}`, { duration: 5000 });
+        } else {
+          toast.error(`❌ ${d.ticker} closed ₹${pnl.toFixed(2)} — ${d.reason || ''}`, { duration: 5000 });
+        }
+      } else if (data.type === 'suggestions_ready') {
+        setSuggestionsNewCount(data.count || 0);
+        toast.info(`💡 ${data.count} stock suggestions ready`, { duration: 4000 });
+      } else if (data.type === 'mode_changed') {
+        setTradingMode(data.mode);
+      } else if (data.type === 'emergency_stop') {
+        toast.error('🚨 Emergency stop triggered! All positions closed.', { duration: 10000 });
         fetchData();
       }
     };
 
     const interval = setInterval(fetchData, 5000);
-    
+
     return () => {
       ws.close();
       clearInterval(interval);
     };
-  }, [fetchData]);
+  }, [fetchData, fetchTradingMode]);
 
   // Fetch signals when ticker changes
   useEffect(() => {
@@ -356,6 +444,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-sentinel-dark text-white p-6">
+      <Toaster position="bottom-right" theme="dark" richColors />
       {/* Header */}
       <header className="flex items-center justify-between mb-8">
         <div className="flex items-center gap-4">
@@ -366,36 +455,53 @@ function App() {
           </div>
         </div>
         
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
+          {/* Paper / Live Mode Toggle */}
+          <button
+            onClick={switchTradingMode}
+            disabled={switchingMode}
+            title={tradingMode === 'paper' ? 'Switch to Live trading (real Zerodha orders)' : 'Switch to Paper trading (simulated)'}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-semibold border transition
+              ${tradingMode === 'live'
+                ? 'bg-orange-500/20 border-orange-500/60 text-orange-300 hover:bg-orange-500/30'
+                : 'bg-blue-500/20 border-blue-500/40 text-blue-300 hover:bg-blue-500/30'
+              } ${switchingMode ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            {tradingMode === 'live'
+              ? <ToggleRight className="w-4 h-4" />
+              : <ToggleLeft className="w-4 h-4" />}
+            {tradingMode === 'live' ? 'LIVE ⚠️' : 'PAPER'}
+          </button>
+
           {/* Connection Status */}
           <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${wsConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
             <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-green-500 pulse-green' : 'bg-red-500 pulse-red'}`} />
             <span className="text-sm">{wsConnected ? 'Connected' : 'Disconnected'}</span>
           </div>
-          
+
           {/* Engine Controls */}
           <div className="flex gap-2">
-            <button 
-              onClick={() => setShowSettings(true)}
+            <button
+              onClick={() => { setShowSettings(true); fetchRiskSettings(); }}
               className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
             >
               <Settings className="w-4 h-4" />
             </button>
-            <button 
+            <button
               onClick={() => controlEngine('start')}
               disabled={status?.running}
               className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition"
             >
               <Play className="w-4 h-4" /> Start
             </button>
-            <button 
+            <button
               onClick={() => controlEngine('stop')}
               disabled={!status?.running}
               className="flex items-center gap-2 px-4 py-2 bg-gray-600 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition"
             >
               <Square className="w-4 h-4" /> Stop
             </button>
-            <button 
+            <button
               onClick={() => controlEngine('emergency_stop')}
               className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg transition"
             >
@@ -512,6 +618,22 @@ function App() {
                   ))}
                 </div>
               </div>
+            </div>
+
+            {/* Risk Settings */}
+            <div className="mt-6 pt-6 border-t border-sentinel-border">
+              <div
+                className="flex items-center justify-between cursor-pointer"
+                onClick={() => setShowRiskSettings(v => !v)}
+              >
+                <h3 className="font-semibold flex items-center gap-2">
+                  <SlidersHorizontal className="w-4 h-4 text-orange-400" /> Risk & Position Sizing
+                </h3>
+                <span className="text-gray-500 text-xs">{showRiskSettings ? '▲ hide' : '▼ show'}</span>
+              </div>
+              {showRiskSettings && riskSettings && (
+                <RiskSettingsPanel settings={riskSettings} apiBase={API_BASE} onSaved={fetchRiskSettings} />
+              )}
             </div>
 
             {/* API Credentials */}
@@ -684,6 +806,19 @@ function App() {
         >
           <FileText className="w-4 h-4" /> Daily Report
         </button>
+        <button
+          onClick={() => { setActiveView('suggestions'); setSuggestionsNewCount(0); }}
+          className={`relative flex items-center gap-2 px-4 py-2 rounded-lg transition ${
+            activeView === 'suggestions' ? 'bg-yellow-500/30 text-yellow-200' : 'text-gray-400 hover:text-white hover:bg-slate-700'
+          }`}
+        >
+          <Sparkles className="w-4 h-4 text-yellow-400" /> Suggestions
+          {suggestionsNewCount > 0 && (
+            <span className="absolute -top-1 -right-1 bg-yellow-500 text-black text-xs font-bold rounded-full w-4 h-4 flex items-center justify-center">
+              {suggestionsNewCount > 9 ? '9+' : suggestionsNewCount}
+            </span>
+          )}
+        </button>
         
         {/* Trading Phase Badge */}
         {tradingPhase && (
@@ -757,6 +892,13 @@ function App() {
 
       {activeView === 'autopsy' && (
         <DailyAutopsy isVisible={true} />
+      )}
+
+      {activeView === 'suggestions' && (
+        <WatchlistSuggestions
+          watchlist={status?.watchlist || []}
+          onAdd={addToWatchlistByTicker}
+        />
       )}
 
       {activeView === 'dashboard' && (
@@ -1070,21 +1212,37 @@ function PositionRow({ position, onClose }) {
 // Component: Trade Row
 function TradeRow({ trade }) {
   const pnl = trade.pnl || 0;
+  const isOpen = !trade.exit_time;
   const isProfit = pnl >= 0;
-  
+  const sentimentScore = trade.sentiment_score;
+
   return (
-    <div className="flex items-center justify-between p-3 bg-gray-700/30 rounded-lg text-sm">
+    <div className={`flex items-center justify-between p-3 rounded-lg text-sm border-l-2 ${
+      isOpen ? 'bg-blue-500/10 border-blue-500' :
+      isProfit ? 'bg-green-500/10 border-green-500' : 'bg-red-500/10 border-red-400'
+    }`}>
       <div className="flex items-center gap-3">
         <span className={`px-2 py-0.5 rounded text-xs ${trade.side === 'BUY' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
           {trade.side}
         </span>
-        <span className="font-medium">{trade.ticker}</span>
+        <div>
+          <span className="font-medium">{trade.ticker}</span>
+          {trade.entry_reason && (
+            <p className="text-xs text-gray-500 truncate max-w-[180px]" title={trade.entry_reason}>
+              {trade.entry_reason}
+            </p>
+          )}
+        </div>
       </div>
       <div className="text-right">
-        <span className={`font-mono ${isProfit ? 'text-green-400' : 'text-red-400'}`}>
-          {isProfit ? '+' : ''}₹{pnl.toFixed(2)}
+        <span className={`font-mono font-semibold ${isOpen ? 'text-blue-300' : isProfit ? 'text-green-400' : 'text-red-400'}`}>
+          {isOpen ? 'OPEN' : `${isProfit ? '+' : ''}₹${pnl.toFixed(2)}`}
         </span>
-        <p className="text-gray-500 text-xs">{trade.reason}</p>
+        {sentimentScore != null && (
+          <p className={`text-xs ${sentimentScore >= 0 ? 'text-purple-400' : 'text-red-400'}`}>
+            Sentiment: {sentimentScore >= 0 ? '+' : ''}{sentimentScore.toFixed(2)}
+          </p>
+        )}
       </div>
     </div>
   );
@@ -1205,6 +1363,80 @@ function NewsPanel({ ticker, apiBase }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// Component: Risk Settings Panel (inside Settings modal)
+function RiskSettingsPanel({ settings, apiBase, onSaved }) {
+  const [tp, setTp] = React.useState((settings.take_profit_pct * 100).toFixed(1));
+  const [sl, setSl] = React.useState((settings.stop_loss_pct * 100).toFixed(1));
+  const [rpt, setRpt] = React.useState(settings.risk_per_trade);
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const res = await fetch(`${apiBase}/settings/risk`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          take_profit_pct: parseFloat(tp) / 100,
+          stop_loss_pct: parseFloat(sl) / 100,
+          risk_per_trade: parseFloat(rpt),
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setSaved(true);
+        onSaved();
+        setTimeout(() => setSaved(false), 2000);
+      }
+    } catch (e) {
+      alert('Save failed: ' + e.message);
+    }
+    setSaving(false);
+  };
+
+  return (
+    <div className="mt-4 bg-gray-700/50 rounded-lg p-4 space-y-4">
+      <p className="text-xs text-gray-400">
+        These control the <strong>SmartTrailingStop</strong> thresholds and position sizing.
+      </p>
+
+      <div className="grid grid-cols-3 gap-3">
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Take-Profit % <span className="text-gray-500">(trail trigger)</span></label>
+          <div className="flex items-center gap-1">
+            <input type="number" value={tp} onChange={e => setTp(e.target.value)}
+              step="0.1" min="0.5" max="20"
+              className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm text-white" />
+            <span className="text-gray-400 text-sm">%</span>
+          </div>
+        </div>
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Stop-Loss % <span className="text-gray-500">(breakeven trigger)</span></label>
+          <div className="flex items-center gap-1">
+            <input type="number" value={sl} onChange={e => setSl(e.target.value)}
+              step="0.1" min="0.2" max="10"
+              className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm text-white" />
+            <span className="text-gray-400 text-sm">%</span>
+          </div>
+        </div>
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Risk per Trade <span className="text-gray-500">(₹)</span></label>
+          <input type="number" value={rpt} onChange={e => setRpt(e.target.value)}
+            step="100" min="100" max="50000"
+            className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm text-white" />
+        </div>
+      </div>
+
+      <button onClick={save} disabled={saving}
+        className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 rounded-lg text-sm">
+        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+        {saved ? 'Saved!' : 'Save Risk Settings'}
+      </button>
     </div>
   );
 }

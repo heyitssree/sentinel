@@ -1,10 +1,12 @@
 """
-Paper Trade Executor for The Sentinel.
-Handles order execution, position tracking, and trade logging.
+Trade Executors for The Sentinel.
+PaperTradeExecutor: local simulation with slippage.
+LiveTradeExecutor:  real Zerodha Kite orders, polls for fill confirmation.
 """
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 import logging
+import time
 from dataclasses import dataclass, field
 
 from src.storage.db import SentinelDB, get_db
@@ -369,3 +371,196 @@ class PaperTradeExecutor:
             'losing_trades': 0,
         }
         self.kite.reset_day()
+
+
+class LiveTradeExecutor:
+    """
+    Executes real Zerodha Kite market orders.
+    Same public interface as PaperTradeExecutor so the engine can swap them at runtime.
+    """
+
+    # How long to wait for order fill confirmation (seconds)
+    FILL_POLL_INTERVAL = 0.5
+    FILL_POLL_TIMEOUT = 15
+
+    def __init__(self, kite, db: SentinelDB = None, slippage_pct: float = 0.0):
+        """
+        Args:
+            kite: RealKite instance (already authenticated)
+            db: SentinelDB for logging
+            slippage_pct: Not applied to live orders (Zerodha handles real fills),
+                          kept for interface compatibility.
+        """
+        self.kite = kite
+        self.db = db or get_db()
+        self.slippage_pct = slippage_pct  # unused for live; kept for compat
+
+        self._active_trades: Dict[int, TradeEntry] = {}
+        self._stats = {
+            'trades_executed': 0,
+            'trades_closed': 0,
+            'total_pnl': 0.0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+        }
+
+    def _get_current_price(self, ticker: str) -> float:
+        quote = self.kite.ltp([f"NSE:{ticker}"])
+        return quote.get(f"NSE:{ticker}", {}).get('last_price', 0)
+
+    def _place_and_confirm(self, ticker: str, transaction_type: str, quantity: int) -> Optional[float]:
+        """
+        Place a Zerodha market order and poll until filled.
+        Returns the average fill price, or None on failure.
+        """
+        try:
+            order_id = self.kite.place_order(
+                variety=self.kite.VARIETY_REGULAR,
+                exchange=self.kite.EXCHANGE_NSE,
+                tradingsymbol=ticker,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                product=self.kite.PRODUCT_MIS,
+                order_type=self.kite.ORDER_TYPE_MARKET,
+            )
+            logger.info(f"[LIVE] Order placed: {order_id} | {transaction_type} {quantity} {ticker}")
+        except Exception as e:
+            logger.error(f"[LIVE] Order placement failed for {ticker}: {e}")
+            return None
+
+        # Poll for fill confirmation
+        deadline = time.time() + self.FILL_POLL_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(self.FILL_POLL_INTERVAL)
+            try:
+                history = self.kite.order_history(order_id)
+                if history:
+                    last = history[-1]
+                    status = last.get('status', '').upper()
+                    if status == 'COMPLETE':
+                        fill_price = float(last.get('average_price', 0))
+                        logger.info(f"[LIVE] Order {order_id} filled @ ₹{fill_price:.2f}")
+                        return fill_price
+                    elif status in ('REJECTED', 'CANCELLED'):
+                        logger.error(f"[LIVE] Order {order_id} {status}: {last.get('status_message')}")
+                        return None
+            except Exception as e:
+                logger.warning(f"[LIVE] Poll error for {order_id}: {e}")
+
+        logger.error(f"[LIVE] Order {order_id} fill timeout after {self.FILL_POLL_TIMEOUT}s")
+        return None
+
+    def execute_entry(self, ticker: str, side: str = "BUY",
+                      quantity: int = None, reason: str = None,
+                      sentiment_score: float = None, chart_safety: str = None,
+                      stop_loss: float = None, take_profit: float = None) -> Optional[TradeEntry]:
+        quantity = quantity or 1
+        fill_price = self._place_and_confirm(ticker, side, quantity)
+        if fill_price is None or fill_price <= 0:
+            return None
+
+        entry_time = datetime.now()
+        trade_id = self.db.insert_trade(
+            ticker=ticker,
+            entry_time=entry_time,
+            entry_price=fill_price,
+            quantity=quantity,
+            side=side,
+            entry_reason=reason,
+            sentiment_score=sentiment_score,
+            chart_safety=chart_safety,
+        )
+        self.db.update_position(
+            ticker=ticker,
+            quantity=quantity if side == "BUY" else -quantity,
+            avg_price=fill_price,
+            side=side,
+            entry_time=entry_time,
+        )
+
+        trade = TradeEntry(
+            ticker=ticker, side=side, quantity=quantity,
+            entry_price=fill_price, entry_time=entry_time,
+            trade_id=trade_id, sentiment_score=sentiment_score,
+            chart_safety=chart_safety, entry_reason=reason,
+            stop_loss=stop_loss, take_profit=take_profit,
+        )
+        self._active_trades[trade_id] = trade
+        self._stats['trades_executed'] += 1
+        return trade
+
+    def execute_exit(self, trade_id: int, reason: str = "Exit") -> Optional[TradeExit]:
+        trade = self._active_trades.get(trade_id)
+        if not trade:
+            db_trade = self.db.get_trade(trade_id)
+            if not db_trade or db_trade['status'] != 'OPEN':
+                return None
+            trade = TradeEntry(
+                ticker=db_trade['ticker'], side=db_trade['side'],
+                quantity=db_trade['quantity'], entry_price=db_trade['entry_price'],
+                entry_time=db_trade['entry_time'], trade_id=trade_id,
+            )
+
+        exit_side = "SELL" if trade.side == "BUY" else "BUY"
+        fill_price = self._place_and_confirm(trade.ticker, exit_side, trade.quantity)
+        if fill_price is None or fill_price <= 0:
+            return None
+
+        exit_time = datetime.now()
+        pnl = self.db.close_trade(trade_id, exit_time, fill_price, reason)
+        self.db.close_position(trade.ticker)
+
+        if trade_id in self._active_trades:
+            del self._active_trades[trade_id]
+
+        self._stats['trades_closed'] += 1
+        self._stats['total_pnl'] += pnl
+        if pnl > 0:
+            self._stats['winning_trades'] += 1
+        else:
+            self._stats['losing_trades'] += 1
+
+        logger.info(f"[LIVE] Trade {trade_id} closed | PnL: ₹{pnl:.2f} | {reason}")
+        return TradeExit(trade_id=trade_id, exit_price=fill_price,
+                         exit_time=exit_time, exit_reason=reason, pnl=pnl)
+
+    def exit_by_ticker(self, ticker: str, reason: str = "Ticker Exit") -> List[TradeExit]:
+        exits = []
+        for trade_id, trade in list(self._active_trades.items()):
+            if trade.ticker == ticker:
+                result = self.execute_exit(trade_id, reason)
+                if result:
+                    exits.append(result)
+        return exits
+
+    def close_all_trades(self, reason: str = "Close All") -> List[TradeExit]:
+        return [r for tid in list(self._active_trades) for r in [self.execute_exit(tid, reason)] if r]
+
+    def get_active_trades(self) -> List[TradeEntry]:
+        return list(self._active_trades.values())
+
+    def has_position(self, ticker: str) -> bool:
+        pos = self.db.get_position(ticker)
+        return pos is not None and pos['quantity'] != 0
+
+    def get_mtm_pnl(self) -> float:
+        total = 0.0
+        for trade in self._active_trades.values():
+            price = self._get_current_price(trade.ticker)
+            if price > 0:
+                total += (price - trade.entry_price) * trade.quantity if trade.side == "BUY" \
+                    else (trade.entry_price - price) * trade.quantity
+        return total
+
+    def get_stats(self) -> Dict:
+        closed = self._stats['trades_closed']
+        return {
+            **self._stats,
+            'active_trades': len(self._active_trades),
+            'unrealized_pnl': self.get_mtm_pnl(),
+            'win_rate': (self._stats['winning_trades'] / closed * 100) if closed > 0 else 0.0,
+        }
+
+    def reset_day(self):
+        self._active_trades.clear()
+        self._stats = {k: 0 if isinstance(v, int) else 0.0 for k, v in self._stats.items()}

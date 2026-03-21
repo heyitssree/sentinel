@@ -51,13 +51,14 @@ from dotenv import load_dotenv, set_key
 from src.storage.db import get_db
 from src.ingestion.mock_kite import MockKite, MockTicker
 from src.ingestion.real_kite import RealKite, RealTicker
-from src.trading.executor import PaperTradeExecutor
+from src.trading.executor import PaperTradeExecutor, LiveTradeExecutor
 from src.trading.risk import RiskManager
 from src.trading.portfolio import PortfolioManager
-from src.signals.indicators import SignalEngine, TechnicalIndicators
+from src.trading.signals import ConfluentSignalEngine, SmartTrailingStop, calculate_atr_position_size
+from src.signals.indicators import TechnicalIndicators
 from src.gemini.sentiment import SentimentAnalyzer, MockSentimentAnalyzer
 from src.gemini.vision import MockVisualAuditor
-from src.gemini.technical_analyst import MockTechnicalAnalyst
+from src.gemini.technical_analyst import TechnicalAnalyst, MockTechnicalAnalyst
 from src.charts.generator import ChartGenerator
 from src.ingestion.news_scraper import NewsScraper, MockNewsScraper
 
@@ -121,16 +122,22 @@ class SentinelEngine:
             self.ticker = MockTicker()
             self.kite.set_ticker(self.ticker)
         
+        self.trading_mode = os.getenv("TRADING_MODE", "paper")  # "paper" or "live"
         self.executor = PaperTradeExecutor(
             kite=self.kite,
             db=self.db,
             slippage_pct=0.0005,
-            default_quantity=10
+            default_quantity=10,
         )
-        
+
         self.risk_manager = RiskManager(mtm_loss_limit=MTM_LOSS_LIMIT)
-        # Lower thresholds for testing (RSI > 40 instead of 60)
-        self.signal_engine = SignalEngine(rsi_entry_threshold=40, rsi_overbought=75)
+        # Use the full ConfluentSignalEngine (200 EMA + RSI crossover + VWAP)
+        self.confluence_engine = ConfluentSignalEngine()
+        # Smart ATR-based trailing stop (3-stage: initial → breakeven → trailing)
+        self.trailing_stop = SmartTrailingStop(
+            breakeven_threshold=float(os.getenv("STOP_LOSS_PCT", 0.01)),
+            trailing_threshold=float(os.getenv("TAKE_PROFIT_PCT", 0.02)),
+        )
         self.indicators = TechnicalIndicators()
         self.chart_gen = ChartGenerator(output_dir="charts")
         # Use real Gemini sentiment if API key available, else mock
@@ -139,8 +146,16 @@ class SentinelEngine:
         else:
             self.sentiment = MockSentimentAnalyzer()
         self.vision = MockVisualAuditor()  # Optional - for external charts
-        self.technical_analyst = MockTechnicalAnalyst()  # Primary - direct data analysis
+        # Use real Gemini TechnicalAnalyst if API key available, else mock
+        if GEMINI_API_KEY:
+            self.technical_analyst = TechnicalAnalyst(api_key=GEMINI_API_KEY)
+        else:
+            self.technical_analyst = MockTechnicalAnalyst()
         self.use_vision = False  # Set True to use vision instead of direct analysis
+        # Cache for watchlist suggestions (ticker -> suggestion dict)
+        self._suggestions_cache: Optional[Dict] = None
+        self._suggestions_cache_time: Optional[datetime] = None
+        self._suggestions_ttl_minutes = 30
         
         # News scraper - use real feeds or mock for testing
         self.use_real_news = True  # Set False for mock news
@@ -222,29 +237,41 @@ class SentinelEngine:
         """Main trading loop - analyzes signals and executes trades."""
         logger.info("Trading loop started - analyzing every 10 seconds")
         candle_count = 0
-        
+        _suggestions_triggered_today = False
+
         while self.running:
             try:
                 await asyncio.sleep(10)  # Analyze every 10 seconds
-                
+
                 if not self.running:
                     break
-                
+
                 candle_count += 1
+                now = datetime.now()
                 logger.info(f"=== Trading Cycle #{candle_count} ===")
-                
+
+                # Auto-trigger suggestions scan at market open (9:15-9:20 AM)
+                if (now.hour == 9 and 15 <= now.minute <= 20
+                        and not _suggestions_triggered_today):
+                    logger.info("Market open — triggering auto suggestions scan...")
+                    asyncio.create_task(self._build_suggestions(force=True))
+                    _suggestions_triggered_today = True
+                # Reset daily flag after market close
+                if now.hour >= 15 and now.minute >= 30:
+                    _suggestions_triggered_today = False
+
                 # Check risk limits first
                 mtm_loss = self.db.get_mtm_loss()
                 risk_state = self.risk_manager.get_state(mtm_loss)
-                
+
                 if risk_state.kill_switch_triggered:
                     logger.warning(f"KILL SWITCH ACTIVE! MTM Loss: ₹{mtm_loss:.2f}")
                     continue
-                
+
                 # Analyze each ticker in watchlist
                 for ticker in self.get_watchlist():
                     await self._analyze_and_trade(ticker)
-                
+
             except asyncio.CancelledError:
                 logger.info("Trading loop cancelled")
                 break
@@ -274,45 +301,50 @@ class SentinelEngine:
     async def _analyze_and_trade(self, ticker: str):
         """Analyze a single ticker and execute trade if conditions met."""
         try:
-            # Get candle data
-            candles = self.db.get_candles(ticker, limit=50)
-            
+            # Need 210+ candles for EMA-200 to be reliable
+            candles = self.db.get_candles(ticker, limit=250)
+
             if candles.empty or len(candles) < 20:
                 logger.debug(f"{ticker}: Insufficient data ({len(candles)} candles)")
                 return
-            
-            # Run signal analysis
-            should_audit, analysis = self.signal_engine.should_trigger_audit(candles)
-            self._last_analysis[ticker] = analysis
-            
+
+            # Run confluence analysis (ConfluentSignalEngine)
+            should_audit, confluence_result = self.confluence_engine.should_trigger_audit(candles, ticker)
+            self._last_analysis[ticker] = {
+                'signal': confluence_result.signal_type.value,
+                'reason': confluence_result.reason,
+                'confidence': confluence_result.confidence,
+                'indicators': confluence_result.indicators,
+                'conditions': confluence_result.conditions,
+            }
+
             current_price = self.prices.get(ticker, 0)
-            indicators = analysis.get('indicators', {})
-            
+            ind = confluence_result.indicators
+
             logger.info(
                 f"{ticker}: Price=₹{current_price:.2f} | "
-                f"RSI={indicators.get('rsi', 0):.1f} | "
-                f"Signal={analysis.get('signal', 'None')} | "
-                f"Reason={analysis.get('reason', 'N/A')[:50]}"
+                f"RSI={ind.get('rsi', 0):.1f} | "
+                f"Signal={confluence_result.signal_type.value} | "
+                f"Conf={confluence_result.confidence:.2f} | "
+                f"Reason={confluence_result.reason[:60]}"
             )
-            
+
             # Check if we already have a position
             positions = self.db.get_all_positions()
             has_position = not positions.empty and ticker in positions['ticker'].values
-            
+
             if has_position:
-                # Check exit conditions
-                await self._check_exit(ticker, current_price, analysis)
+                await self._check_exit(ticker, current_price, confluence_result)
             elif should_audit:
-                # New entry signal - run Gemini audit
-                await self._execute_entry(ticker, current_price, analysis)
-                
+                await self._execute_entry(ticker, current_price, confluence_result)
+
         except Exception as e:
             logger.error(f"Analysis error for {ticker}: {e}")
     
-    async def _execute_entry(self, ticker: str, price: float, analysis: dict):
+    async def _execute_entry(self, ticker: str, price: float, confluence_result):
         """Execute a new trade entry after Gemini audit."""
         logger.info(f">>> ENTRY SIGNAL for {ticker} at ₹{price:.2f}")
-        
+
         # Sentiment check using real news headlines
         headlines = self.news_scraper.get_recent_headlines(ticker, limit=5)
         if not headlines:
@@ -320,108 +352,247 @@ class SentinelEngine:
             logger.debug(f"{ticker}: No news found, using placeholder")
         else:
             logger.info(f"{ticker}: Found {len(headlines)} news headlines for sentiment analysis")
-        
+
         sentiment = self.sentiment.analyze(ticker, headlines)
         logger.info(f"{ticker}: Sentiment score = {sentiment.score:.2f} ({sentiment.recommendation})")
-        
+
         if sentiment.score < 0:
             logger.info(f"{ticker}: Skipping - negative sentiment")
             return
-        
-        # Technical analysis - use direct data (primary) or vision (optional)
+
+        # Technical analysis via Gemini TechnicalAnalyst
         candles = self.db.get_candles(ticker, limit=20)
-        indicators = analysis.get('indicators', {})
-        indicators['current_price'] = price
-        
-        if self.use_vision:
-            # Optional: Vision-based analysis for external charts
-            vision_result = self.vision.analyze_chart(ticker, "charts/temp.png")
-            logger.info(f"{ticker}: Vision audit = {vision_result.safety} ({vision_result.pattern_detected})")
-            chart_safety = vision_result.safety
-            pattern = vision_result.pattern_detected
-            if vision_result.safety == 'RISKY':
-                logger.info(f"{ticker}: Skipping - chart looks risky")
-                return
-        else:
-            # Primary: Direct data analysis (more efficient)
-            tech_result = self.technical_analyst.analyze(ticker, candles, indicators)
-            logger.info(f"{ticker}: Technical analysis = {tech_result.recommendation} "
-                       f"(conf={tech_result.confidence:.2f}, pattern={tech_result.pattern_detected})")
-            chart_safety = "SAFE" if tech_result.recommendation == "BUY" else "RISKY"
-            pattern = tech_result.pattern_detected
-            if tech_result.recommendation == "SELL":
-                logger.info(f"{ticker}: Skipping - technical analysis says SELL")
-                return
-            if tech_result.recommendation == "HOLD" and tech_result.confidence < 0.5:
-                logger.info(f"{ticker}: Skipping - low confidence HOLD")
-                return
-        
-        # Check portfolio funds
+        ind = confluence_result.indicators
+        indicators_for_analyst = {**ind, 'current_price': price}
+
+        tech_result = self.technical_analyst.analyze(ticker, candles, indicators_for_analyst)
+        logger.info(f"{ticker}: Technical analysis = {tech_result.recommendation} "
+                    f"(conf={tech_result.confidence:.2f}, pattern={tech_result.pattern_detected})")
+        chart_safety = "SAFE" if tech_result.recommendation == "BUY" else "RISKY"
+        pattern = tech_result.pattern_detected
+        if tech_result.recommendation == "SELL":
+            logger.info(f"{ticker}: Skipping - technical analysis says SELL")
+            return
+        if tech_result.recommendation == "HOLD" and tech_result.confidence < 0.5:
+            logger.info(f"{ticker}: Skipping - low confidence HOLD")
+            return
+
+        # ATR-based position sizing
+        atr = ind.get('atr', 0)
         portfolio = self.portfolio.get_portfolio()
-        quantity = 10  # Default quantity
+        risk_per_trade = float(os.getenv("RISK_PER_TRADE", 500))
+        if atr > 0:
+            quantity = calculate_atr_position_size(
+                total_capital=portfolio.get('total_value', 100000),
+                risk_per_trade=risk_per_trade,
+                atr=atr,
+                price=price,
+            )
+        else:
+            quantity = 10  # fallback
+        quantity = max(1, quantity)
+
         cost = price * quantity
-        
         if portfolio['available_cash'] < cost:
             logger.warning(f"{ticker}: Insufficient funds. Need ₹{cost:.2f}, have ₹{portfolio['available_cash']:.2f}")
             return
-        
+
+        # Determine trade side from confluence signal
+        from src.trading.signals import SignalType
+        side = "BUY" if confluence_result.signal_type == SignalType.LONG_ENTRY else "SELL"
+
         # Execute trade
         trade = self.executor.execute_entry(
             ticker=ticker,
-            side="BUY",
+            side=side,
             quantity=quantity,
-            reason=f"{analysis.get('reason', 'Signal triggered')} | Pattern: {pattern}",
+            reason=f"{confluence_result.reason} | Pattern: {pattern}",
             sentiment_score=sentiment.score,
-            chart_safety=chart_safety
+            chart_safety=chart_safety,
         )
-        
+
         if trade:
-            logger.info(f"✓ TRADE EXECUTED: BUY {quantity} {ticker} @ ₹{trade.entry_price:.2f}")
-            # Update portfolio
+            logger.info(f"✓ TRADE EXECUTED: {side} {quantity} {ticker} @ ₹{trade.entry_price:.2f}")
             self.portfolio.execute_buy(ticker, quantity, trade.entry_price)
-            # Broadcast to WebSocket
+            # Register with SmartTrailingStop
+            self.trailing_stop.register_position(
+                ticker=ticker,
+                entry_price=trade.entry_price,
+                entry_time=trade.entry_time,
+                quantity=quantity,
+                side=side,
+                atr=atr if atr > 0 else trade.entry_price * 0.01,
+            )
             await manager.broadcast({
                 "type": "trade_executed",
-                "data": {"ticker": ticker, "side": "BUY", "price": trade.entry_price, "quantity": quantity}
+                "data": {
+                    "ticker": ticker, "side": side,
+                    "price": trade.entry_price, "quantity": quantity,
+                    "mode": self.trading_mode,
+                }
             })
         else:
             logger.error(f"✗ Trade execution failed for {ticker}")
-    
-    async def _check_exit(self, ticker: str, current_price: float, analysis: dict):
-        """Check if we should exit an existing position."""
+
+    async def _build_suggestions(self, force: bool = False) -> List[Dict]:
+        """
+        Scan Nifty 50 stocks and return AI-ranked suggestions.
+        Results are cached for _suggestions_ttl_minutes.
+        """
+        try:
+            from config.nifty50 import NIFTY_50
+        except ImportError:
+            from src.trading.portfolio import NIFTY_50 as _nifty_list
+            NIFTY_50 = {t: type('S', (), {'name': t, 'sector': 'Unknown', 'weight': 0})() for t in _nifty_list}
+
+        # Check cache
+        if not force and self._suggestions_cache is not None and self._suggestions_cache_time:
+            age_min = (datetime.now() - self._suggestions_cache_time).total_seconds() / 60
+            if age_min < self._suggestions_ttl_minutes:
+                return self._suggestions_cache
+
+        logger.info("Building watchlist suggestions — scoring Nifty 50...")
+        scored = []
+
+        for ticker in NIFTY_50:
+            try:
+                candles = self.db.get_candles(ticker, limit=50)
+                if candles.empty or len(candles) < 20:
+                    continue
+
+                rsi_series = self.indicators.calculate_rsi(candles, 14)
+                vwap_series = self.indicators.calculate_vwap(candles)
+                ema20_series = self.indicators.calculate_ema(candles, 20)
+                vol_info = self.indicators.get_volume_spike_info(candles)
+
+                rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 50.0
+                vwap = float(vwap_series.iloc[-1]) if not vwap_series.empty else 0
+                ema20 = float(ema20_series.iloc[-1]) if not ema20_series.empty else 0
+                price = float(candles['close'].iloc[-1])
+                vol_ratio = float(vol_info.get('ratio', 1.0))
+
+                # Technical score (0-1)
+                rsi_score = min(max((rsi - 40) / 40, 0), 1)          # bullish if RSI 40-80
+                vwap_score = 1.0 if price > vwap > 0 else 0.0
+                ema_score = 1.0 if price > ema20 > 0 else 0.0
+                vol_score = min(vol_ratio / 3.0, 1.0)
+                tech_score = (rsi_score * 0.4 + vwap_score * 0.3 + ema_score * 0.3)
+
+                # Sentiment score (0-1, centered from -1..1)
+                headlines = self.news_scraper.get_recent_headlines(ticker, limit=5)
+                if headlines:
+                    sent = self.sentiment.analyze(ticker, headlines)
+                    sentiment_score = (sent.score + 1) / 2  # map -1..1 → 0..1
+                else:
+                    sentiment_score = 0.5
+
+                combined = tech_score * 0.4 + sentiment_score * 0.4 + vol_score * 0.2
+
+                stock_info = NIFTY_50[ticker]
+                scored.append({
+                    'ticker': ticker,
+                    'name': getattr(stock_info, 'name', ticker),
+                    'sector': getattr(stock_info, 'sector', 'Unknown'),
+                    'price': price,
+                    'combined_score': round(combined, 3),
+                    'technical_score': round(tech_score, 3),
+                    'sentiment_score': round(sentiment_score, 3),
+                    'volume_score': round(vol_score, 3),
+                    'rsi': round(rsi, 1),
+                    'pattern': None,
+                    'reasoning': None,
+                    'recommendation': None,
+                })
+            except Exception as e:
+                logger.warning(f"Suggestions: error scoring {ticker}: {e}")
+
+        # Sort by combined score, take top 10 for Gemini deep-analysis
+        scored.sort(key=lambda x: x['combined_score'], reverse=True)
+        top10 = scored[:10]
+
+        logger.info(f"Top 10 candidates for Gemini analysis: {[s['ticker'] for s in top10]}")
+
+        # Run TechnicalAnalyst on top 10
+        for item in top10:
+            try:
+                candles = self.db.get_candles(item['ticker'], limit=20)
+                ind = {
+                    'rsi': item['rsi'],
+                    'vwap': 0,
+                    'ema20': 0,
+                    'ema50': 0,
+                    'current_price': item['price'],
+                }
+                result = self.technical_analyst.analyze(item['ticker'], candles, ind)
+                item['pattern'] = result.pattern_detected
+                item['reasoning'] = result.reasoning
+                item['recommendation'] = result.recommendation
+            except Exception as e:
+                logger.warning(f"Suggestions: Gemini analysis failed for {item['ticker']}: {e}")
+                item['pattern'] = 'N/A'
+                item['reasoning'] = 'Analysis unavailable'
+                item['recommendation'] = 'HOLD'
+
+        # Broadcast to WebSocket clients
+        await manager.broadcast({
+            "type": "suggestions_ready",
+            "count": len(top10),
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        self._suggestions_cache = top10
+        self._suggestions_cache_time = datetime.now()
+        logger.info(f"Suggestions built: {len(top10)} stocks scored and ranked")
+        return top10
+
+    async def _check_exit(self, ticker: str, current_price: float, confluence_result):
+        """Check if we should exit an existing position using SmartTrailingStop."""
         positions = self.db.get_all_positions()
         pos = positions[positions['ticker'] == ticker].iloc[0]
-        
-        avg_price = pos['avg_price']
-        quantity = pos['quantity']
-        pnl_pct = ((current_price - avg_price) / avg_price) * 100
-        
-        # Exit conditions: 2% profit or 1% loss
-        should_exit = False
-        exit_reason = ""
-        
-        if pnl_pct >= 2.0:
-            should_exit = True
-            exit_reason = f"Take profit: +{pnl_pct:.2f}%"
-        elif pnl_pct <= -1.0:
-            should_exit = True
-            exit_reason = f"Stop loss: {pnl_pct:.2f}%"
-        elif analysis.get('signal') == 'OVERBOUGHT':
-            should_exit = True
-            exit_reason = "RSI overbought"
-        
-        if should_exit:
+        quantity = int(pos['quantity'])
+
+        # Get EMA-9 for trailing stop
+        candles = self.db.get_candles(ticker, limit=30)
+        ema_9_series = self.indicators.calculate_ema_9(candles)
+        ema_9 = float(ema_9_series.iloc[-1]) if not ema_9_series.empty else current_price
+
+        # Update trailing stop (3-stage: initial ATR → breakeven → trailing EMA-9)
+        new_sl, stop_stage, exit_signal = self.trailing_stop.update_stop(
+            ticker=ticker,
+            current_price=current_price,
+            ema_9=ema_9,
+            current_time=datetime.now(),
+        )
+
+        # Also check if candle closed below EMA-9 (trailing stage exit)
+        if exit_signal is None and not candles.empty:
+            candle_close = float(candles['close'].iloc[-1])
+            exit_signal = self.trailing_stop.check_ema_exit(ticker, candle_close, ema_9)
+
+        # Fallback: if position not registered with trailing stop, use percentage exits
+        pos_state = self.trailing_stop.get_position(ticker)
+        if pos_state is None:
+            avg_price = float(pos['avg_price'])
+            pnl_pct = ((current_price - avg_price) / avg_price) * 100
+            from src.trading.signals import SignalType
+            if pnl_pct >= float(os.getenv("TAKE_PROFIT_PCT", 0.02)) * 100:
+                exit_signal = SignalType.EXIT_PROFIT
+            elif pnl_pct <= -float(os.getenv("STOP_LOSS_PCT", 0.01)) * 100:
+                exit_signal = SignalType.EXIT_STOP
+
+        if exit_signal is not None:
+            exit_reason = f"SmartStop: {exit_signal.value} (stage={stop_stage.value if hasattr(stop_stage,'value') else stop_stage})"
             logger.info(f"<<< EXIT SIGNAL for {ticker}: {exit_reason}")
-            
-            # Close via executor
+
             exits = self.executor.exit_by_ticker(ticker, reason=exit_reason)
             if exits:
-                # Update portfolio
-                success, pnl = self.portfolio.execute_sell(ticker, quantity, current_price)
-                
+                avg_price = float(pos['avg_price'])
+                pnl = (current_price - avg_price) * quantity
+                success, _ = self.portfolio.execute_sell(ticker, quantity, current_price)
+                self.trailing_stop.remove_position(ticker)
+
                 if success:
-                    logger.info(f"✓ POSITION CLOSED: {ticker} P&L=₹{pnl:.2f} ({pnl_pct:.2f}%)")
-                    
+                    logger.info(f"✓ POSITION CLOSED: {ticker} P&L=₹{pnl:.2f}")
                     await manager.broadcast({
                         "type": "position_closed",
                         "data": {"ticker": ticker, "pnl": pnl, "reason": exit_reason}
@@ -520,6 +691,7 @@ async def get_status():
         "prices": engine.prices,
         "stats": stats,
         "portfolio": portfolio,
+        "trading_mode": engine.trading_mode,
         "risk": {
             "mtm_loss": risk_state.current_mtm_loss,
             "limit": MTM_LOSS_LIMIT,
@@ -1410,6 +1582,148 @@ async def toggle_market_data_source():
         "success": True,
         "source": "real" if engine.use_real_kite else "mock",
         "message": f"Switched to {'Real Zerodha Kite' if engine.use_real_kite else 'Mock Kite'}"
+    }
+
+
+# =============================================================================
+# Trading Mode Toggle (Paper ↔ Live)
+# =============================================================================
+
+class TradingModeRequest(BaseModel):
+    mode: str  # "paper" or "live"
+
+
+@app.post("/api/trading-mode")
+async def set_trading_mode(request: TradingModeRequest):
+    """Switch order execution between paper and live mode at runtime."""
+    mode = request.mode.lower()
+    if mode not in ("paper", "live"):
+        raise HTTPException(status_code=400, detail="mode must be 'paper' or 'live'")
+
+    if mode == "live":
+        api_key = os.getenv("KITE_API_KEY")
+        access_token = os.getenv("KITE_ACCESS_TOKEN")
+        if not api_key or not access_token:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot switch to Live mode: KITE_API_KEY and KITE_ACCESS_TOKEN must be set"
+            )
+        engine.executor = LiveTradeExecutor(kite=engine.kite, db=engine.db)
+        logger.info("Switched to LIVE order execution (real Zerodha orders)")
+    else:
+        engine.executor = PaperTradeExecutor(
+            kite=engine.kite, db=engine.db, slippage_pct=0.0005, default_quantity=10
+        )
+        logger.info("Switched to PAPER order execution (simulated)")
+
+    engine.trading_mode = mode
+    set_key(str(ENV_FILE), "TRADING_MODE", mode)
+    os.environ["TRADING_MODE"] = mode
+
+    await manager.broadcast({"type": "mode_changed", "mode": mode})
+    return {"success": True, "mode": mode}
+
+
+@app.get("/api/trading-mode")
+async def get_trading_mode():
+    """Get current trading mode."""
+    return {
+        "mode": engine.trading_mode,
+        "live_ready": bool(os.getenv("KITE_API_KEY") and os.getenv("KITE_ACCESS_TOKEN")),
+    }
+
+
+# =============================================================================
+# AI Watchlist Suggestions
+# =============================================================================
+
+@app.get("/api/watchlist/suggestions")
+async def get_watchlist_suggestions(force: bool = False):
+    """
+    Return Gemini-ranked Nifty 50 stock suggestions.
+    Runs a fresh scan when force=true or cache is expired (30 min TTL).
+    """
+    try:
+        suggestions = await engine._build_suggestions(force=force)
+        cache_age_min = None
+        if engine._suggestions_cache_time:
+            cache_age_min = round((datetime.now() - engine._suggestions_cache_time).total_seconds() / 60, 1)
+        return {
+            "suggestions": suggestions,
+            "count": len(suggestions),
+            "cached": not force and cache_age_min is not None and cache_age_min < engine._suggestions_ttl_minutes,
+            "cache_age_minutes": cache_age_min,
+            "last_scan": engine._suggestions_cache_time.isoformat() if engine._suggestions_cache_time else None,
+            "watchlist": engine.get_watchlist(),
+        }
+    except Exception as e:
+        logger.error(f"Suggestions endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Risk Settings
+# =============================================================================
+
+class RiskSettingsRequest(BaseModel):
+    take_profit_pct: Optional[float] = None   # e.g. 0.02 = 2%
+    stop_loss_pct: Optional[float] = None     # e.g. 0.01 = 1%
+    risk_per_trade: Optional[float] = None    # e.g. 500 (INR)
+    mtm_limit: Optional[float] = None        # kill-switch threshold
+
+
+@app.post("/api/settings/risk")
+async def update_risk_settings(request: RiskSettingsRequest):
+    """Update runtime risk parameters."""
+    updated = {}
+
+    if request.take_profit_pct is not None:
+        if not 0.005 <= request.take_profit_pct <= 0.20:
+            raise HTTPException(status_code=400, detail="take_profit_pct must be 0.5%–20%")
+        set_key(str(ENV_FILE), "TAKE_PROFIT_PCT", str(request.take_profit_pct))
+        os.environ["TAKE_PROFIT_PCT"] = str(request.take_profit_pct)
+        engine.trailing_stop.trailing_threshold = request.take_profit_pct
+        updated["take_profit_pct"] = request.take_profit_pct
+
+    if request.stop_loss_pct is not None:
+        if not 0.002 <= request.stop_loss_pct <= 0.10:
+            raise HTTPException(status_code=400, detail="stop_loss_pct must be 0.2%–10%")
+        set_key(str(ENV_FILE), "STOP_LOSS_PCT", str(request.stop_loss_pct))
+        os.environ["STOP_LOSS_PCT"] = str(request.stop_loss_pct)
+        engine.trailing_stop.breakeven_threshold = request.stop_loss_pct
+        updated["stop_loss_pct"] = request.stop_loss_pct
+
+    if request.risk_per_trade is not None:
+        if not 100 <= request.risk_per_trade <= 50000:
+            raise HTTPException(status_code=400, detail="risk_per_trade must be ₹100–₹50,000")
+        set_key(str(ENV_FILE), "RISK_PER_TRADE", str(request.risk_per_trade))
+        os.environ["RISK_PER_TRADE"] = str(request.risk_per_trade)
+        updated["risk_per_trade"] = request.risk_per_trade
+
+    if request.mtm_limit is not None:
+        ceiling = float(os.getenv("MTM_LOSS_CEILING", "0.03")) * float(os.getenv("STARTING_CAPITAL", "100000"))
+        if request.mtm_limit > ceiling:
+            raise HTTPException(status_code=400, detail=f"mtm_limit cannot exceed ceiling ₹{ceiling:.0f}")
+        engine.risk_manager = RiskManager(mtm_loss_limit=request.mtm_limit)
+        set_key(str(ENV_FILE), "MTM_LOSS_LIMIT", str(request.mtm_limit))
+        os.environ["MTM_LOSS_LIMIT"] = str(request.mtm_limit)
+        updated["mtm_limit"] = request.mtm_limit
+
+    return {"success": True, "updated": updated}
+
+
+@app.get("/api/settings/risk")
+async def get_risk_settings():
+    """Get current risk parameter values."""
+    return {
+        "take_profit_pct": float(os.getenv("TAKE_PROFIT_PCT", 0.02)),
+        "stop_loss_pct": float(os.getenv("STOP_LOSS_PCT", 0.01)),
+        "risk_per_trade": float(os.getenv("RISK_PER_TRADE", 500)),
+        "mtm_limit": float(os.getenv("MTM_LOSS_LIMIT", 5000)),
+        "trailing_stop_stage": {
+            ticker: state.stop_stage.value
+            for ticker, state in engine.trailing_stop.get_all_positions().items()
+        },
     }
 
 
