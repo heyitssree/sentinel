@@ -1,17 +1,34 @@
 """
 FastAPI server for The Sentinel Web Dashboard.
 Provides REST API and WebSocket for real-time updates.
+
+SSL Security:
+- Uses certifi certificates by default (secure)
+- SSL bypass only enabled in development mode via SENTINEL_DEV_MODE=true
+- Production deployments should NEVER set SENTINEL_DEV_MODE=true
 """
-# SSL certificate fix for macOS - MUST be before any other imports
 import os
 import ssl
 import certifi
+
+# Configure SSL certificates properly (secure by default)
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
-try:
-    ssl._create_default_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
+
+# ONLY bypass SSL verification in explicit development mode
+# WARNING: Never enable this in production - vulnerable to MITM attacks
+_DEV_MODE = os.getenv('SENTINEL_DEV_MODE', 'false').lower() == 'true'
+if _DEV_MODE:
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+        import warnings
+        warnings.warn(
+            "SSL verification disabled (SENTINEL_DEV_MODE=true). "
+            "DO NOT use in production!", 
+            UserWarning
+        )
+    except AttributeError:
+        pass
 
 import asyncio
 import json
@@ -61,6 +78,53 @@ from src.gemini.vision import MockVisualAuditor
 from src.gemini.technical_analyst import TechnicalAnalyst, MockTechnicalAnalyst
 from src.charts.generator import ChartGenerator
 from src.ingestion.news_scraper import NewsScraper, MockNewsScraper
+import numpy as np
+import pandas as pd
+
+# Environment file path - defined early as it's used in multiple endpoints
+ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+
+
+import re
+
+# Ticker validation pattern - uppercase letters only, 1-20 chars
+_TICKER_PATTERN = re.compile(r'^[A-Z]{1,20}$')
+
+def validate_ticker(ticker: str) -> str:
+    """Validate and normalize ticker symbol. Raises HTTPException if invalid."""
+    ticker = ticker.upper().strip()
+    if not _TICKER_PATTERN.match(ticker):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid ticker symbol: {ticker}. Must be 1-20 uppercase letters."
+        )
+    return ticker
+
+
+def sanitize_for_json(obj):
+    """
+    Recursively convert numpy/pandas types to native Python types for JSON serialization.
+    Prevents 'numpy.bool is not JSON serializable' errors.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj) if not np.isnan(obj) else None
+    elif isinstance(obj, np.ndarray):
+        return sanitize_for_json(obj.tolist())
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif isinstance(obj, (pd.Series, pd.DataFrame)):
+        return sanitize_for_json(obj.to_dict())
+    elif pd.isna(obj):
+        return None
+    return obj
 
 
 class ConnectionManager:
@@ -78,11 +142,20 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
     
     async def broadcast(self, message: dict):
+        """Broadcast message to all connected clients, removing dead connections."""
+        dead_connections = []
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except:
-                pass
+            except WebSocketDisconnect:
+                dead_connections.append(connection)
+            except Exception as e:
+                logger.warning(f"WebSocket broadcast error: {e}")
+                dead_connections.append(connection)
+        
+        # Clean up dead connections
+        for conn in dead_connections:
+            self.disconnect(conn)
 
 
 class SentinelEngine:
@@ -703,9 +776,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# CORS Configuration - use environment variable for production
+# Default allows all for development; set ALLOWED_ORIGINS in production
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+if _allowed_origins == ["*"]:
+    logger.warning("CORS: Allowing all origins (set ALLOWED_ORIGINS env var for production)")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1097,7 +1176,7 @@ async def get_confluence_status(ticker: str):
     rsi_check = bool(latest_rsi is not None and latest_rsi > 60)
     vwap_check = bool(latest_vwap is not None and latest_price > latest_vwap)
     
-    return {
+    return sanitize_for_json({
         "ticker": ticker,
         "confluence_met": bool(result.is_valid),
         "signal_type": result.signal_type.value if result.signal_type else None,
@@ -1131,7 +1210,7 @@ async def get_confluence_status(ticker: str):
         },
         "volume": volume_data,
         "timestamp": datetime.now().isoformat()
-    }
+    })
 
 
 @app.get("/api/sentiment/{ticker}")
@@ -1233,9 +1312,7 @@ async def get_chart_data(ticker: str, interval: str = "5min", limit: int = 100):
                 })
         return result
     
-    import pandas as pd
-    
-    return {
+    return sanitize_for_json({
         "ticker": ticker,
         "interval": interval,
         "candles": formatted_candles,
@@ -1247,7 +1324,7 @@ async def get_chart_data(ticker: str, interval: str = "5min", limit: int = 100):
             "rsi": format_series(rsi, candles)
         },
         "count": len(formatted_candles)
-    }
+    })
 
 
 @app.get("/api/schedule/phase")
@@ -1274,12 +1351,36 @@ async def get_nifty50_heatmap():
             rsi_value = None
             volume_spike = False
             price = 0.0
+            ema_200_value = None
+            vwap_value = None
         else:
             rsi = engine.indicators.calculate_rsi(candles, 14)
             rsi_value = float(rsi.iloc[-1]) if not rsi.empty and len(rsi) > 0 else None
             volume_info = engine.indicators.get_volume_spike_info(candles)
             volume_spike = bool(volume_info['is_spike'])  # Convert numpy.bool to Python bool
             price = float(candles['close'].iloc[-1])
+            
+            # Calculate 200 EMA and VWAP for new heatmap indicators
+            ema_200 = engine.indicators.calculate_ema_200(candles)
+            ema_200_value = float(ema_200.iloc[-1]) if not ema_200.empty and len(ema_200) > 0 else None
+            
+            vwap = engine.indicators.calculate_vwap(candles)
+            vwap_value = float(vwap.iloc[-1]) if not vwap.empty and len(vwap) > 0 else None
+        
+        # Calculate distance percentages for heatmap coloring
+        ema_200_distance_pct = None
+        vwap_distance_pct = None
+        in_vwap_pullback_zone = False
+        above_ema_200 = None
+        
+        if price > 0 and ema_200_value and ema_200_value > 0:
+            ema_200_distance_pct = ((price - ema_200_value) / ema_200_value) * 100
+            above_ema_200 = price > ema_200_value
+        
+        if price > 0 and vwap_value and vwap_value > 0:
+            vwap_distance_pct = ((price - vwap_value) / vwap_value) * 100
+            # VWAP pullback zone: within 0.5% of VWAP (either side)
+            in_vwap_pullback_zone = abs(vwap_distance_pct) <= 0.5
         
         # Determine RSI status
         if rsi_value is None:
@@ -1303,7 +1404,14 @@ async def get_nifty50_heatmap():
             "rsi_status": rsi_status,
             "volume_spike": volume_spike,
             "in_watchlist": in_watchlist,
-            "weight": stock.weight
+            "weight": stock.weight,
+            # New fields for enhanced heatmap
+            "ema_200": ema_200_value,
+            "ema_200_distance_pct": ema_200_distance_pct,
+            "above_ema_200": above_ema_200,
+            "vwap": vwap_value,
+            "vwap_distance_pct": vwap_distance_pct,
+            "in_vwap_pullback_zone": in_vwap_pullback_zone
         }
         
         heatmap_data.append(stock_data)
@@ -1322,12 +1430,12 @@ async def get_nifty50_heatmap():
                 "stocks": sectors_data[sector]
             })
     
-    return {
+    return sanitize_for_json({
         "stocks": heatmap_data,
         "sectors": ordered_sectors,
         "timestamp": datetime.now().isoformat(),
         "total_stocks": len(heatmap_data)
-    }
+    })
 
 
 @app.get("/api/autopsy/daily")
@@ -1515,17 +1623,18 @@ async def execute_trade(request: TradeRequest):
 @app.post("/api/close/{ticker}")
 async def close_position(ticker: str):
     """Close position for a ticker."""
-    if ticker not in WATCHLIST:
+    if ticker not in engine.get_watchlist():
         raise HTTPException(status_code=400, detail=f"Ticker {ticker} not in watchlist")
     
-    closed = engine.executor.close_trade(ticker, reason="Manual close from dashboard")
+    # Use correct method name: exit_by_ticker instead of close_trade
+    exits = engine.executor.exit_by_ticker(ticker, reason="Manual close from dashboard")
     
-    if closed:
+    if exits:
         await manager.broadcast({
             "type": "position_closed",
-            "data": {"ticker": ticker}
+            "data": {"ticker": ticker, "exits": len(exits)}
         })
-        return {"success": True, "ticker": ticker}
+        return {"success": True, "ticker": ticker, "trades_closed": len(exits)}
     
     raise HTTPException(status_code=404, detail=f"No open position for {ticker}")
 
@@ -1574,7 +1683,7 @@ async def get_chart(ticker: str):
 
 
 # Connection Testing & Credential Management
-ENV_FILE = Path(__file__).parent.parent.parent / ".env"
+# (ENV_FILE is defined at top of file)
 
 
 @app.get("/api/credentials/status")
@@ -2107,4 +2216,7 @@ if frontend_path.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Security: Default to localhost, allow override via environment for production
+    host = os.getenv("API_HOST", "127.0.0.1")
+    port = int(os.getenv("API_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)

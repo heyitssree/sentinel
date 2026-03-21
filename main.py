@@ -9,8 +9,12 @@ import sys
 import time
 import signal
 import logging
+import threading
+import asyncio
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -23,7 +27,9 @@ from config.settings import (
 from src.storage.db import SentinelDB, get_db
 from src.ingestion.mock_kite import MockKite, MockTicker
 from src.ingestion.news_scraper import NewsScraper, MockNewsScraper
-from src.signals.indicators import SignalEngine, TechnicalIndicators
+from src.signals.indicators import TechnicalIndicators
+from src.trading.signals import ConfluentSignalEngine, SmartTrailingStop
+from src.gemini.regime_detector import RegimeDetector, MockRegimeDetector
 from src.charts.generator import ChartGenerator
 from src.gemini.sentiment import SentimentAnalyzer, MockSentimentAnalyzer
 from src.gemini.vision import VisualAuditor, MockVisualAuditor
@@ -76,9 +82,13 @@ class Sentinel:
         self._init_analyzers()
         self._init_trading()
         
-        # Candle aggregation
+        # Candle aggregation with thread-safe access
         self._candle_data = {ticker: [] for ticker in WATCHLIST}
         self._last_candle_time = {ticker: None for ticker in WATCHLIST}
+        self._candle_lock = threading.Lock()  # Protects _candle_data and _last_candle_time
+        
+        # ThreadPoolExecutor for parallel ticker analysis
+        self._executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="sentinel_analysis")
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -106,9 +116,15 @@ class Sentinel:
     
     def _init_analyzers(self):
         """Initialize analysis components."""
-        # Signal engine
-        self.signal_engine = SignalEngine()
+        # Signal engine - using new ConfluentSignalEngine with VWAP pullback logic
+        self.signal_engine = ConfluentSignalEngine()
         self.indicators = TechnicalIndicators()
+        
+        # Regime detector for market condition awareness
+        if self.use_mock_gemini or not GEMINI_API_KEY:
+            self.regime_detector = MockRegimeDetector()
+        else:
+            self.regime_detector = RegimeDetector(GEMINI_API_KEY)
         
         # Chart generator
         self.chart_gen = ChartGenerator(output_dir="charts")
@@ -145,6 +161,9 @@ class Sentinel:
             default_quantity=DEFAULT_QUANTITY
         )
         
+        # Smart trailing stop manager for dynamic stop loss management
+        self.trailing_stop = SmartTrailingStop()
+        
         logger.info(f"Trading initialized | Kill switch: ₹{MTM_LOSS_LIMIT}")
     
     def _signal_handler(self, signum, frame):
@@ -178,7 +197,7 @@ class Sentinel:
             self._aggregate_tick(symbol, tick)
     
     def _aggregate_tick(self, symbol: str, tick: dict):
-        """Aggregate tick data into candles."""
+        """Aggregate tick data into candles. Thread-safe."""
         now = datetime.now()
         candle_start = now.replace(
             minute=(now.minute // 5) * 5,
@@ -186,25 +205,26 @@ class Sentinel:
             microsecond=0
         )
         
-        if self._last_candle_time.get(symbol) != candle_start:
-            # New candle period
-            if self._candle_data[symbol]:
-                # Save previous candle
-                self._save_candle(symbol)
+        with self._candle_lock:
+            if self._last_candle_time.get(symbol) != candle_start:
+                # New candle period
+                if self._candle_data[symbol]:
+                    # Save previous candle (lock already held)
+                    self._save_candle_locked(symbol)
+                
+                # Start new candle
+                self._candle_data[symbol] = []
+                self._last_candle_time[symbol] = candle_start
             
-            # Start new candle
-            self._candle_data[symbol] = []
-            self._last_candle_time[symbol] = candle_start
-        
-        # Add tick to current candle
-        self._candle_data[symbol].append({
-            'price': tick['last_price'],
-            'volume': tick.get('last_traded_quantity', 0),
-            'timestamp': now
-        })
+            # Add tick to current candle
+            self._candle_data[symbol].append({
+                'price': tick['last_price'],
+                'volume': tick.get('last_traded_quantity', 0),
+                'timestamp': now
+            })
     
-    def _save_candle(self, symbol: str):
-        """Save aggregated candle to database."""
+    def _save_candle_locked(self, symbol: str):
+        """Save aggregated candle to database. Must be called with _candle_lock held."""
         ticks = self._candle_data[symbol]
         if not ticks:
             return
@@ -215,7 +235,7 @@ class Sentinel:
         candle = {
             'ticker': symbol,
             'timestamp': self._last_candle_time[symbol],
-            'open': prices[0],
+            'open_': prices[0],
             'high': max(prices),
             'low': min(prices),
             'close': prices[-1],
@@ -228,6 +248,11 @@ class Sentinel:
         candle['vwap'] = total_pv / total_vol if total_vol > 0 else prices[-1]
         
         self.db.insert_candle(**candle)
+    
+    def _save_candle(self, symbol: str):
+        """Save aggregated candle to database. Thread-safe wrapper."""
+        with self._candle_lock:
+            self._save_candle_locked(symbol)
     
     def _fetch_news(self, ticker: str):
         """Fetch and store news for a ticker."""
@@ -262,14 +287,17 @@ class Sentinel:
             self.executor.check_stop_loss_take_profit()
             return False
         
-        # Run signal analysis
-        should_audit, analysis = self.signal_engine.should_trigger_audit(candles)
+        # Run signal analysis with new ConfluentSignalEngine
+        should_audit, analysis = self.signal_engine.should_trigger_audit(candles, ticker)
         
         if not should_audit:
-            logger.debug(f"{ticker}: No signal | {analysis.get('reason', '')}")
+            logger.debug(f"{ticker}: No signal | {analysis.reason}")
             return False
         
-        logger.info(f"🔔 {ticker}: Signal detected! Running Gemini audit...")
+        # Determine trade side from signal type
+        side = "BUY" if analysis.signal_type.name == "LONG_ENTRY" else "SELL"
+        
+        logger.info(f"🔔 {ticker}: {side} Signal detected! Running Gemini audit...")
         
         # Feature A: Sentiment Analysis
         headlines = self.db.get_recent_news(ticker, limit=10)
@@ -308,17 +336,18 @@ class Sentinel:
             logger.warning(f"Trade blocked by risk manager")
             return False
         
-        # Calculate stop loss using ATR
+        # Calculate dynamic ATR-based stops
         atr = self.indicators.calculate_atr(candles, 14)
         latest_atr = atr.iloc[-1] if not atr.empty else candles['close'].iloc[-1] * 0.02
         entry_price = candles['close'].iloc[-1]
-        stop_loss = self.signal_engine.get_stop_loss(entry_price, latest_atr)
-        take_profit = self.signal_engine.get_take_profit(entry_price, latest_atr)
+        stop_loss, take_profit = self.signal_engine.calculate_dynamic_stops(
+            entry_price=entry_price, atr=latest_atr, side=side
+        )
         
         trade = self.executor.execute_entry(
             ticker=ticker,
-            side="BUY",
-            reason=analysis.get('reason', 'Signal triggered'),
+            side=side,
+            reason=analysis.reason,
             sentiment_score=sentiment_result.score,
             chart_safety=vision_result.safety,
             stop_loss=stop_loss,
@@ -327,15 +356,167 @@ class Sentinel:
         
         if trade:
             self.risk_manager.post_order_record()
-            logger.info(f"🚀 TRADE EXECUTED: {ticker} @ ₹{trade.entry_price:.2f}")
+            # Register position with smart trailing stop manager
+            self.trailing_stop.register_position(
+                ticker=ticker,
+                entry_price=trade.entry_price,
+                entry_time=trade.entry_time,
+                quantity=trade.quantity,
+                side=trade.side,
+                atr=latest_atr
+            )
+            logger.info(f"🚀 TRADE EXECUTED: {side} {ticker} @ ₹{trade.entry_price:.2f}")
             logger.info(f"   SL: ₹{stop_loss:.2f} | TP: ₹{take_profit:.2f}")
             return True
         
         return False
     
+    def _process_tickers_parallel(self, tickers: List[str]) -> List[Tuple[str, bool, any]]:
+        """
+        Process tickers in parallel using ThreadPoolExecutor.
+        Async-ready: Can be replaced with asyncio.gather for full WebSocket integration.
+        
+        Args:
+            tickers: List of ticker symbols to process
+            
+        Returns:
+            List of (ticker, success, result) tuples
+        """
+        def process_ticker(ticker: str) -> Tuple[str, bool, any]:
+            """Process a single ticker (news + analysis)."""
+            try:
+                self._fetch_news(ticker)
+                trade_executed = self._analyze_ticker(ticker)
+                return (ticker, True, trade_executed)
+            except Exception as e:
+                return (ticker, False, str(e))
+        
+        results = []
+        futures = {self._executor.submit(process_ticker, ticker): ticker for ticker in tickers}
+        
+        try:
+            for future in as_completed(futures, timeout=60):
+                ticker = futures[future]
+                try:
+                    result = future.result(timeout=10)
+                    results.append(result)
+                except Exception as e:
+                    results.append((ticker, False, str(e)))
+        except TimeoutError:
+            # Handle tickers that didn't complete within the overall timeout
+            for future, ticker in futures.items():
+                if not future.done():
+                    logger.warning(f"Analysis timeout for {ticker}")
+                    results.append((ticker, False, "Analysis timeout (>60s)"))
+                    future.cancel()
+        
+        return results
+    
+    async def _process_tickers_async(self, tickers: List[str]) -> List[Tuple[str, bool, any]]:
+        """
+        Async version of ticker processing for WebSocket-driven execution.
+        Paves the way for full async architecture with real-time data feeds.
+        
+        Args:
+            tickers: List of ticker symbols to process
+            
+        Returns:
+            List of (ticker, success, result) tuples
+        """
+        async def process_ticker_async(ticker: str) -> Tuple[str, bool, any]:
+            """Process a single ticker asynchronously."""
+            try:
+                # Run blocking operations in thread pool
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(self._executor, self._fetch_news, ticker)
+                trade_executed = await loop.run_in_executor(
+                    self._executor, self._analyze_ticker, ticker
+                )
+                return (ticker, True, trade_executed)
+            except Exception as e:
+                return (ticker, False, str(e))
+        
+        # Process all tickers concurrently
+        tasks = [process_ticker_async(ticker) for ticker in tickers]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle any exceptions from gather
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                processed_results.append((tickers[i], False, str(result)))
+            else:
+                processed_results.append(result)
+        
+        return processed_results
+    
+    def _get_nifty_data(self) -> dict:
+        """Fetch NIFTY 50 index data for regime detection."""
+        try:
+            # Use NIFTY 50 index or a proxy (e.g., NIFTYBEES ETF)
+            nifty_ticker = "NIFTY 50"  # Or use actual index ticker
+            candles = self.db.get_candles(nifty_ticker, limit=100)
+            
+            if candles.empty or len(candles) < 50:
+                # Fallback: use aggregate of watchlist
+                return self._get_aggregate_market_data()
+            
+            ema_50 = self.indicators.calculate_ema(candles, 50)
+            ema_200 = self.indicators.calculate_ema_200(candles)
+            
+            return {
+                'current_price': float(candles['close'].iloc[-1]),
+                'ema_50': float(ema_50.iloc[-1]) if not ema_50.empty else 0,
+                'ema_200': float(ema_200.iloc[-1]) if not ema_200.empty else 0,
+                'high_24h': float(candles['high'].max()),
+                'low_24h': float(candles['low'].min()),
+                'range_pct': float((candles['high'].max() - candles['low'].min()) / candles['close'].iloc[-1] * 100),
+                'volume_ratio': float(candles['volume'].iloc[-1] / candles['volume'].mean()) if candles['volume'].mean() > 0 else 1.0,
+                'recent_candles': candles.tail(6).to_dict('records')
+            }
+        except Exception as e:
+            logger.warning(f"Failed to get NIFTY data: {e}")
+            return self._get_aggregate_market_data()
+    
+    def _get_aggregate_market_data(self) -> dict:
+        """Get aggregate market data from watchlist as fallback."""
+        prices = []
+        for ticker in WATCHLIST[:5]:
+            candles = self.db.get_candles(ticker, limit=10)
+            if not candles.empty:
+                prices.append(candles['close'].iloc[-1])
+        
+        avg_price = sum(prices) / len(prices) if prices else 100
+        return {
+            'current_price': avg_price,
+            'ema_50': avg_price,
+            'ema_200': avg_price,
+            'high_24h': avg_price * 1.01,
+            'low_24h': avg_price * 0.99,
+            'range_pct': 2.0,
+            'volume_ratio': 1.0,
+            'recent_candles': []
+        }
+    
     def _run_heartbeat(self):
         """Main heartbeat loop - runs every candle interval."""
         logger.info(f"Heartbeat: {datetime.now().strftime('%H:%M:%S')}")
+        
+        # Check regime and adjust risk limits if needed
+        if self.regime_detector.should_check_regime():
+            logger.info("🔍 Checking market regime...")
+            nifty_data = self._get_nifty_data()
+            regime_state = self.regime_detector.analyze_regime(nifty_data)
+            
+            if regime_state.kill_switch_multiplier < 1.0:
+                self.risk_manager.kill_switch.apply_regime_multiplier(
+                    regime_state.kill_switch_multiplier,
+                    regime_state.regime.value
+                )
+                logger.warning(f"⚠️ CHOPPY regime detected - risk limit reduced to {regime_state.kill_switch_multiplier:.0%}")
+            else:
+                # Reset to full limit for trending markets
+                self.risk_manager.kill_switch.reset_regime_multiplier()
         
         # Check risk state
         mtm_loss = self.db.get_mtm_loss()
@@ -351,20 +532,43 @@ class Sentinel:
             self.executor.close_all_trades("End of Day Square Off")
             return False
         
-        # Process each ticker
-        for ticker in WATCHLIST:
-            try:
-                # Fetch news
-                self._fetch_news(ticker)
-                
-                # Run analysis
-                self._analyze_ticker(ticker)
-                
-            except Exception as e:
-                logger.error(f"Error processing {ticker}: {e}")
+        # Process tickers in parallel - async-ready architecture
+        # Uses ThreadPoolExecutor for CPU-bound work, preparing for full async with WebSockets
+        results = self._process_tickers_parallel(WATCHLIST)
+        
+        for ticker, success, result in results:
+            if not success:
+                logger.error(f"Error processing {ticker}: {result}")
         
         # Check stop loss / take profit for all positions
         self.executor.check_stop_loss_take_profit()
+        
+        # Update smart trailing stops for all active positions
+        positions_to_remove = []
+        for ticker, position in self.trailing_stop.get_all_positions().items():
+            try:
+                candles = self.db.get_candles(ticker, limit=20)
+                if candles.empty:
+                    continue
+                    
+                current_price = candles['close'].iloc[-1]
+                ema_9 = self.indicators.calculate_ema_9(candles)
+                current_ema_9 = ema_9.iloc[-1] if not ema_9.empty else current_price
+                
+                new_sl, stage, exit_signal = self.trailing_stop.update_stop(
+                    ticker, current_price, current_ema_9
+                )
+                
+                if exit_signal:
+                    logger.info(f"🛑 {ticker}: Trailing/Time stop triggered at ₹{current_price:.2f}")
+                    self.executor.exit_by_ticker(ticker, reason="Trailing/Time Stop Hit")
+                    positions_to_remove.append(ticker)
+            except Exception as e:
+                logger.warning(f"Trailing stop update failed for {ticker}: {e}")
+        
+        # Clean up exited positions from trailing stop manager
+        for ticker in positions_to_remove:
+            self.trailing_stop.remove_position(ticker)
         
         # Log stats
         stats = self.executor.get_stats()
@@ -447,6 +651,10 @@ class Sentinel:
         logger.info("🛑 Initiating shutdown...")
         
         self._running = False
+        
+        # Shutdown thread pool executor
+        logger.info("Shutting down thread pool...")
+        self._executor.shutdown(wait=True, cancel_futures=True)
         
         # Close all positions
         if self.executor.get_active_trades():

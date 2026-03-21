@@ -1,13 +1,12 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  Shield, Activity, TrendingUp, TrendingDown, DollarSign,
+  Shield, Activity, TrendingUp, DollarSign,
   AlertTriangle, Play, Square, Zap, BarChart3, Newspaper,
   RefreshCw, XCircle, CheckCircle, Clock, Plus, Minus,
-  Wallet, PieChart, Settings, RotateCcw, Key, Loader2, Eye, EyeOff,
-  LayoutGrid, Brain, FileText, CandlestickChart, Sparkles, ToggleLeft, ToggleRight,
+  Wallet, Settings, RotateCcw, Key, Loader2, Eye, EyeOff,
+  LayoutGrid, FileText, CandlestickChart, Sparkles, ToggleLeft, ToggleRight,
   SlidersHorizontal
 } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { Toaster, toast } from 'sonner';
 
 import AIReasoningPanel from './components/AIReasoningPanel';
@@ -39,7 +38,7 @@ function App() {
   const [suggestionsNewCount, setSuggestionsNewCount] = useState(0); // badge
   const [riskSettings, setRiskSettings] = useState(null);
   const [showRiskSettings, setShowRiskSettings] = useState(false);
-  
+
   // Credentials state
   const [credentials, setCredentials] = useState(null);
   const [geminiKey, setGeminiKey] = useState('');
@@ -63,7 +62,7 @@ function App() {
         fetch(`${API_BASE}/trades?limit=20`),
         fetch(`${API_BASE}/watchlist`)
       ]);
-      
+
       setStatus(await statusRes.json());
       setPositions((await positionsRes.json()).positions);
       setTrades((await tradesRes.json()).trades);
@@ -161,20 +160,46 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // WebSocket connection
-  useEffect(() => {
-    fetchData();
-    fetchTradingMode();
+  // WebSocket connection with exponential backoff
+  const wsRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
+  const reconnectAttemptRef = useRef(0);
+  const maxReconnectAttempts = 10;
+  const baseReconnectDelay = 1000;
+
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     // Use relative WebSocket URL — works behind any proxy/port
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsHost = window.location.host.includes(':5173')
       ? `${window.location.hostname}:8000`  // Vite dev server — backend on 8000
       : window.location.host;
-    const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws`);
 
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = () => setWsConnected(false);
+    const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setWsConnected(true);
+      reconnectAttemptRef.current = 0;
+      console.log('WebSocket connected');
+    };
+
+    ws.onclose = (event) => {
+      setWsConnected(false);
+      wsRef.current = null;
+
+      // Don't reconnect if closed cleanly or max attempts reached
+      if (event.code === 1000 || reconnectAttemptRef.current >= maxReconnectAttempts) return;
+
+      // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s (max)
+      const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttemptRef.current), 32000);
+      reconnectAttemptRef.current++;
+      console.log(`WebSocket reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current})`);
+
+      reconnectTimeoutRef.current = setTimeout(connectWebSocket, delay);
+    };
+
     ws.onerror = () => setWsConnected(false);
 
     ws.onmessage = (event) => {
@@ -212,14 +237,21 @@ function App() {
         fetchData();
       }
     };
+  }, [fetchData]);
+
+  useEffect(() => {
+    fetchData();
+    fetchTradingMode();
+    connectWebSocket();
 
     const interval = setInterval(fetchData, 5000);
 
     return () => {
-      ws.close();
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (wsRef.current) wsRef.current.close(1000);
       clearInterval(interval);
     };
-  }, [fetchData, fetchTradingMode]);
+  }, [fetchData, fetchTradingMode, connectWebSocket]);
 
   // Fetch signals when ticker changes
   useEffect(() => {
@@ -237,14 +269,23 @@ function App() {
   // Control engine
   const controlEngine = async (action) => {
     try {
-      await fetch(`${API_BASE}/control`, {
+      console.log(`Engine control: ${action}`);
+      const response = await fetch(`${API_BASE}/control`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action })
       });
+      const result = await response.json();
+      console.log(`Engine control result:`, result);
+      if (!response.ok) {
+        toast.error(result.detail || 'Failed to control engine');
+      } else {
+        toast.success(`Engine ${action} successful`);
+      }
       fetchData();
     } catch (error) {
       console.error('Error controlling engine:', error);
+      toast.error(`Failed to ${action} engine: ${error.message}`);
     }
   };
 
@@ -279,11 +320,11 @@ function App() {
     const ticker = customTicker.trim().toUpperCase();
     if (!ticker) return;
     if (ticker.length < 2 || ticker.length > 20) {
-      alert('Ticker must be 2-20 characters');
+      toast.error('Ticker must be 2-20 characters');
       return;
     }
     if (status?.watchlist?.includes(ticker)) {
-      alert(`${ticker} is already in watchlist`);
+      toast.warning(`${ticker} is already in watchlist`);
       return;
     }
     await addToWatchlist(ticker);
@@ -294,7 +335,7 @@ function App() {
   const setCapital = async () => {
     const amount = parseFloat(capitalInput);
     if (isNaN(amount) || amount < 10000) {
-      alert('Minimum capital is ₹10,000');
+      toast.error('Minimum capital is ₹10,000');
       return;
     }
     try {
@@ -386,7 +427,7 @@ function App() {
       if (data.success) {
         setGeminiKey('');
         fetchCredentials();
-        alert('Gemini API key updated successfully');
+        toast.success('Gemini API key updated successfully');
       }
     } catch (error) {
       console.error('Error updating Gemini key:', error);
@@ -400,8 +441,8 @@ function App() {
       const res = await fetch(`${API_BASE}/credentials/update`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          credential_type: 'zerodha', 
+        body: JSON.stringify({
+          credential_type: 'zerodha',
           api_key: zerodhaKey,
           api_secret: zerodhaSecret || undefined
         })
@@ -411,7 +452,7 @@ function App() {
         setZerodhaKey('');
         setZerodhaSecret('');
         fetchCredentials();
-        alert('Zerodha credentials updated successfully');
+        toast.success('Zerodha credentials updated successfully');
       }
     } catch (error) {
       console.error('Error updating Zerodha credentials:', error);
@@ -428,13 +469,20 @@ function App() {
   // Execute trade
   const executeTrade = async (ticker, side) => {
     try {
-      await fetch(`${API_BASE}/trade`, {
+      const res = await fetch(`${API_BASE}/trade`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ticker, side })
       });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(`Trade Executed: ${side} ${ticker} @ ₹${data.price?.toFixed(2) || 'N/A'}`);
+      } else {
+        toast.error(data.error || 'Unknown error');
+      }
       fetchData();
     } catch (error) {
+      toast.error(error.message);
       console.error('Error executing trade:', error);
     }
   };
@@ -442,9 +490,21 @@ function App() {
   // Close position
   const closePosition = async (ticker) => {
     try {
-      await fetch(`${API_BASE}/close/${ticker}`, { method: 'POST' });
+      const res = await fetch(`${API_BASE}/close/${ticker}`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        const pnl = data.pnl || 0;
+        if (pnl >= 0) {
+          toast.success(`${ticker} closed with P&L: ₹${pnl.toFixed(2)}`);
+        } else {
+          toast.warning(`${ticker} closed with P&L: ₹${pnl.toFixed(2)}`);
+        }
+      } else {
+        toast.error(data.error || 'Unknown error');
+      }
       fetchData();
     } catch (error) {
+      toast.error(error.message);
       console.error('Error closing position:', error);
     }
   };
@@ -470,11 +530,11 @@ function App() {
         <div className="flex items-center gap-4">
           <Shield className="w-10 h-10 text-blue-500" />
           <div>
-            <h1 className="text-2xl font-bold">The Sentinel</h1>
-            <p className="text-gray-400 text-sm">Multimodal Alpha Engine</p>
+            <h1 className="text-xl md:text-2xl font-bold">The Sentinel</h1>
+            <p className="text-gray-400 text-xs md:text-sm">Multimodal Alpha Engine</p>
           </div>
         </div>
-        
+
         <div className="flex items-center gap-3">
           {/* Paper / Live Mode Toggle */}
           <button
@@ -494,9 +554,9 @@ function App() {
           </button>
 
           {/* Connection Status */}
-          <div className={`flex items-center gap-2 px-3 py-1 rounded-full ${wsConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+          <div className={`flex items-center gap-2 px-2 md:px-3 py-1 rounded-full text-xs md:text-sm ${wsConnected ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
             <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-green-500 pulse-green' : 'bg-red-500 pulse-red'}`} />
-            <span className="text-sm">{wsConnected ? 'Connected' : 'Disconnected'}</span>
+            <span className="hidden xs:inline">{wsConnected ? 'Connected' : 'Disconnected'}</span>
           </div>
 
           {/* Engine Controls */}
@@ -510,22 +570,22 @@ function App() {
             <button
               onClick={() => controlEngine('start')}
               disabled={status?.running}
-              className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition"
+              className="flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition text-sm"
             >
-              <Play className="w-4 h-4" /> Start
+              <Play className="w-4 h-4" /> <span className="hidden md:inline">Start</span>
             </button>
             <button
               onClick={() => controlEngine('stop')}
               disabled={!status?.running}
-              className="flex items-center gap-2 px-4 py-2 bg-gray-600 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition"
+              className="flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 bg-gray-600 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition text-sm"
             >
-              <Square className="w-4 h-4" /> Stop
+              <Square className="w-4 h-4" /> <span className="hidden md:inline">Stop</span>
             </button>
             <button
               onClick={() => controlEngine('emergency_stop')}
-              className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg transition"
+              className="flex items-center gap-1 md:gap-2 px-2 md:px-4 py-1.5 md:py-2 bg-red-600 hover:bg-red-700 rounded-lg transition text-sm"
             >
-              <Zap className="w-4 h-4" /> Emergency
+              <Zap className="w-4 h-4" /> <span className="hidden lg:inline">Emergency</span>
             </button>
           </div>
         </div>
@@ -565,7 +625,7 @@ function App() {
                     Set Capital
                   </button>
                 </div>
-                <button 
+                <button
                   onClick={resetPortfolio}
                   className="mt-3 flex items-center gap-2 text-sm text-red-400 hover:text-red-300"
                 >
@@ -579,7 +639,7 @@ function App() {
               <h3 className="font-semibold mb-3 flex items-center gap-2">
                 <TrendingUp className="w-4 h-4 text-green-400" /> Watchlist Management
               </h3>
-              
+
               {/* Current Watchlist */}
               <div className="bg-gray-700/50 rounded-lg p-4 mb-4">
                 <p className="text-sm text-gray-400 mb-2">Current Watchlist ({status?.watchlist?.length || 0}/10)</p>
@@ -587,7 +647,7 @@ function App() {
                   {status?.watchlist?.map(ticker => (
                     <span key={ticker} className="flex items-center gap-1 bg-blue-500/20 text-blue-400 px-3 py-1 rounded-full text-sm">
                       {ticker}
-                      <button 
+                      <button
                         onClick={() => removeFromWatchlist(ticker)}
                         className="hover:text-red-400 ml-1"
                         disabled={status?.watchlist?.length <= 1}
@@ -602,7 +662,7 @@ function App() {
               {/* Available Stocks */}
               <div className="bg-gray-700/50 rounded-lg p-4">
                 <p className="text-sm text-gray-400 mb-2">Add Stocks</p>
-                
+
                 {/* Manual Stock Input */}
                 <div className="flex gap-2 mb-3">
                   <input
@@ -622,7 +682,7 @@ function App() {
                     <Plus className="w-4 h-4" /> Add
                   </button>
                 </div>
-                
+
                 {/* Preset Stocks */}
                 <p className="text-xs text-gray-500 mb-2">Quick Add (Nifty 50):</p>
                 <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto">
@@ -675,7 +735,7 @@ function App() {
                   </div>
                   <span className="text-sm text-gray-400 font-mono">{credentials?.gemini?.masked}</span>
                 </div>
-                
+
                 <div className="flex gap-2 mb-3">
                   <div className="flex-1 relative">
                     <input
@@ -685,148 +745,132 @@ function App() {
                       placeholder="Enter Gemini API key"
                       className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white pr-10"
                     />
-                    <button 
+                    <button
                       onClick={() => setShowGeminiKey(!showGeminiKey)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
                     >
                       {showGeminiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
-                  <button 
-                    onClick={updateGeminiKey}
-                    disabled={!geminiKey.trim()}
-                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg"
-                  >
+                  <button onClick={updateGeminiKey} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm">
                     Save
                   </button>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <button 
-                    onClick={testGemini}
-                    disabled={testingGemini}
-                    className="flex items-center gap-2 px-3 py-1.5 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm"
-                  >
-                    {testingGemini ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                    Test Connection
-                  </button>
-                  {geminiTestResult && (
-                    <span className={`text-sm ${geminiTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
-                      {geminiTestResult.success ? '✓ ' + geminiTestResult.message : '✗ ' + geminiTestResult.error}
-                    </span>
-                  )}
-                </div>
+                <button
+                  onClick={testGemini}
+                  disabled={testingGemini}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-gray-600 hover:bg-gray-500 disabled:opacity-50 rounded-lg text-sm"
+                >
+                  {testingGemini ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+                  Test Connection
+                </button>
+                {geminiTestResult && (
+                  <p className={`text-sm mt-2 ${geminiTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
+                    {geminiTestResult.success ? '✓ ' + geminiTestResult.message : '✗ ' + geminiTestResult.error}
+                  </p>
+                )}
               </div>
 
               {/* Zerodha API */}
-              <div className="bg-gray-700/50 rounded-lg p-4 space-y-4">
-                {/* Header */}
-                <div className="flex items-center justify-between">
+              <div className="bg-gray-700/50 rounded-lg p-4">
+                <div className="flex items-center justify-between mb-3">
                   <div className="flex items-center gap-2">
                     <span className="font-medium">Zerodha Kite API</span>
                     {credentials?.zerodha?.configured ? (
                       <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">Configured</span>
                     ) : (
-                      <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded">Paper Mode</span>
+                      <span className="text-xs bg-red-500/20 text-red-400 px-2 py-0.5 rounded">Not Set</span>
                     )}
                   </div>
-                  <span className="text-sm text-gray-400 font-mono">{credentials?.zerodha?.api_key_masked}</span>
+                  <span className="text-sm text-gray-400 font-mono">{credentials?.zerodha?.masked}</span>
                 </div>
 
-                {/* API Key + Secret save */}
-                <div className="space-y-2">
-                  <p className="text-xs text-gray-400 font-medium uppercase tracking-wide">API Credentials</p>
-                  <div className="flex gap-2">
-                    <div className="flex-1 relative">
-                      <input
-                        type={showZerodhaKey ? "text" : "password"}
-                        value={zerodhaKey}
-                        onChange={(e) => setZerodhaKey(e.target.value)}
-                        placeholder="API Key"
-                        className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white pr-10"
-                      />
-                      <button
-                        onClick={() => setShowZerodhaKey(!showZerodhaKey)}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
-                      >
-                        {showZerodhaKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="flex gap-2">
+                <div className="flex gap-2 mb-2">
+                  <div className="flex-1 relative">
                     <input
-                      type="password"
-                      value={zerodhaSecret}
-                      onChange={(e) => setZerodhaSecret(e.target.value)}
-                      placeholder="API Secret"
-                      className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white"
+                      type={showZerodhaKey ? "text" : "password"}
+                      value={zerodhaKey}
+                      onChange={(e) => setZerodhaKey(e.target.value)}
+                      placeholder="API Key"
+                      className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white pr-10"
                     />
                     <button
-                      onClick={updateZerodhaCredentials}
-                      disabled={!zerodhaKey.trim()}
-                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg text-sm"
+                      onClick={() => setShowZerodhaKey(!showZerodhaKey)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
                     >
-                      Save
+                      {showZerodhaKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
+                  <input
+                    type="password"
+                    value={zerodhaSecret}
+                    onChange={(e) => setZerodhaSecret(e.target.value)}
+                    placeholder="API Secret (optional)"
+                    className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white"
+                  />
+                  <button onClick={updateZerodhaCredentials} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm">
+                    Save
+                  </button>
                 </div>
 
-                {/* Daily re-auth flow */}
-                <div className="border-t border-gray-600 pt-3 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <p className="text-xs text-gray-400 font-medium uppercase tracking-wide">Daily Authentication</p>
-                    <span className="text-xs text-gray-500">Access tokens expire every day</span>
-                  </div>
+                {/* Zerodha Daily OAuth */}
+                <div className="mt-4 pt-4 border-t border-gray-600">
+                  <p className="text-sm font-medium text-gray-300 mb-3">Daily Login (OAuth)</p>
+                  <p className="text-xs text-gray-500 mb-3">
+                    Zerodha requires a fresh access token each trading day. Follow these steps each morning before trading.
+                  </p>
+                  <div className="space-y-3">
+                    {/* Step 1 */}
+                    <div className="flex items-start gap-3">
+                      <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">1</span>
+                      <div className="flex-1">
+                        <p className="text-sm text-gray-300 mb-1">Open Zerodha login — a browser tab will open</p>
+                        <button
+                          onClick={openZerodhaLogin}
+                          className="flex items-center gap-2 px-3 py-1.5 bg-orange-600 hover:bg-orange-500 rounded-lg text-sm font-medium text-white transition"
+                        >
+                          <Key className="w-3.5 h-3.5" />
+                          Open Zerodha Login
+                        </button>
+                        {zerodhaAuthResult && !zerodhaAuthResult.success && (
+                          <p className="text-xs text-red-400 mt-1">{zerodhaAuthResult.error}</p>
+                        )}
+                      </div>
+                    </div>
 
-                  {/* Step 1 */}
-                  <div className="flex items-start gap-3">
-                    <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">1</span>
-                    <div className="flex-1">
-                      <p className="text-sm text-gray-300 mb-1">Open Zerodha login — a browser tab will open</p>
-                      <button
-                        onClick={openZerodhaLogin}
-                        className="flex items-center gap-2 px-3 py-1.5 bg-orange-600 hover:bg-orange-500 rounded-lg text-sm font-medium text-white transition"
-                      >
-                        <Key className="w-3.5 h-3.5" />
-                        Open Zerodha Login
-                      </button>
-                      {zerodhaAuthResult && !zerodhaAuthResult.success && (
-                        <p className="text-xs text-red-400 mt-1">{zerodhaAuthResult.error}</p>
-                      )}
+                    {/* Step 2 */}
+                    <div className="flex items-start gap-3">
+                      <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">2</span>
+                      <div className="flex-1">
+                        <p className="text-sm text-gray-300 mb-1">Log in with your Zerodha credentials</p>
+                        <p className="text-xs text-gray-500">After login, Zerodha redirects back to Sentinel which saves the token automatically. You'll see a confirmation page — close that tab and come back here.</p>
+                      </div>
+                    </div>
+
+                    {/* Step 3 */}
+                    <div className="flex items-start gap-3">
+                      <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">3</span>
+                      <div className="flex-1">
+                        <p className="text-sm text-gray-300 mb-1">Verify the connection</p>
+                        <button
+                          onClick={testZerodha}
+                          disabled={testingZerodha}
+                          className="flex items-center gap-2 px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 rounded-lg text-sm font-medium text-white transition"
+                        >
+                          {testingZerodha ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />}
+                          {testingZerodha ? 'Checking…' : 'Verify Connection'}
+                        </button>
+                        {zerodhaTestResult && (
+                          <p className={`text-sm mt-1 ${zerodhaTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
+                            {zerodhaTestResult.success ? '✓ ' + zerodhaTestResult.message : '✗ ' + zerodhaTestResult.error}
+                          </p>
+                        )}
+                      </div>
                     </div>
                   </div>
 
-                  {/* Step 2 */}
-                  <div className="flex items-start gap-3">
-                    <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">2</span>
-                    <div className="flex-1">
-                      <p className="text-sm text-gray-300 mb-1">Log in with your Zerodha credentials</p>
-                      <p className="text-xs text-gray-500">After login, Zerodha redirects back to Sentinel which saves the token automatically. You'll see a confirmation page — close that tab and come back here.</p>
-                    </div>
-                  </div>
-
-                  {/* Step 3 */}
-                  <div className="flex items-start gap-3">
-                    <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">3</span>
-                    <div className="flex-1">
-                      <p className="text-sm text-gray-300 mb-1">Verify the connection</p>
-                      <button
-                        onClick={testZerodha}
-                        disabled={testingZerodha}
-                        className="flex items-center gap-2 px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 rounded-lg text-sm font-medium text-white transition"
-                      >
-                        {testingZerodha ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />}
-                        {testingZerodha ? 'Checking…' : 'Verify Connection'}
-                      </button>
-                      {zerodhaTestResult && (
-                        <p className={`text-sm mt-1 ${zerodhaTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
-                          {zerodhaTestResult.success ? '✓ ' + zerodhaTestResult.message : '✗ ' + zerodhaTestResult.error}
-                        </p>
-                      )}
-                    </div>
-                  </div>
                 </div>
-
               </div>
             </div>
           </div>
@@ -891,7 +935,7 @@ function App() {
 
         {/* Trading Phase Badge */}
         {tradingPhase && (
-          <div className={`ml-4 px-3 py-1 rounded-full text-xs font-medium ${
+          <div className={`self-start sm:self-auto sm:ml-2 px-2 md:px-3 py-1 rounded-full text-[10px] md:text-xs font-medium ${
             tradingPhase.phase === 'ACTIVE' ? 'bg-green-500/20 text-green-400' :
             tradingPhase.phase === 'OBSERVATION' ? 'bg-yellow-500/20 text-yellow-400' :
             tradingPhase.phase === 'SQUAREOFF' ? 'bg-red-500/20 text-red-400' :
@@ -947,31 +991,31 @@ function App() {
       )}
 
       {activeView === 'chart' && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
+          <div className="lg:col-span-2 order-1">
             <TradingChart
               ticker={selectedTicker}
               candles={chartData.candles || []}
               indicators={chartData.indicators || {}}
               position={positions.find(p => p.ticker === selectedTicker)}
               trades={trades.filter(t => t.ticker === selectedTicker)}
-              height={500}
+              height={typeof window !== 'undefined' && window.innerWidth < 768 ? 350 : 500}
             />
           </div>
-          <div className="space-y-4">
+          <div className="space-y-3 md:space-y-4 order-2">
             <AIReasoningPanel ticker={selectedTicker} />
-            
+
             {/* Ticker Selector */}
-            <div className="bg-slate-800 rounded-lg p-4 border border-slate-700">
-              <h4 className="text-sm font-medium text-slate-400 mb-3">Select Ticker</h4>
-              <div className="flex flex-wrap gap-2">
+            <div className="bg-slate-800 rounded-lg p-3 md:p-4 border border-slate-700">
+              <h4 className="text-xs md:text-sm font-medium text-slate-400 mb-2 md:mb-3">Select Ticker</h4>
+              <div className="flex flex-wrap gap-1.5 md:gap-2 max-h-32 overflow-y-auto">
                 {status?.watchlist?.map(ticker => (
                   <button
                     key={ticker}
                     onClick={() => setSelectedTicker(ticker)}
-                    className={`px-3 py-1 rounded-lg text-sm transition ${
-                      selectedTicker === ticker 
-                        ? 'bg-blue-600 text-white' 
+                    className={`px-2 md:px-3 py-1 rounded-lg text-xs md:text-sm transition ${
+                      selectedTicker === ticker
+                        ? 'bg-blue-600 text-white'
                         : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
                     }`}
                   >
@@ -1027,10 +1071,10 @@ function App() {
             </p>
           </div>
         </div>
-      </div>
+          </div>
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+          {/* Stats Cards */}
+          <div className="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-2 md:gap-4 mb-4 md:mb-8">
         <StatCard
           title="Realized P&L"
           value={`₹${(status?.portfolio?.realized_pnl || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`}
@@ -1059,15 +1103,15 @@ function App() {
       </div>
 
       {/* Risk Bar */}
-      <div className="bg-sentinel-card rounded-xl p-4 mb-8 border border-sentinel-border">
+      <div className="bg-sentinel-card rounded-xl p-3 md:p-4 mb-4 md:mb-8 border border-sentinel-border">
         <div className="flex items-center justify-between mb-2">
-          <span className="text-gray-400">Risk Utilization</span>
-          <span className="text-sm">
-            ₹{Math.abs(status?.risk?.mtm_loss || 0).toFixed(2)} / ₹{status?.risk?.limit?.toLocaleString()}
+          <span className="text-gray-400 text-xs md:text-sm">Risk Utilization</span>
+          <span className="text-xs md:text-sm">
+            ₹{Math.abs(status?.risk?.mtm_loss || 0).toFixed(0)} / ₹{status?.risk?.limit?.toLocaleString()}
           </span>
         </div>
-        <div className="h-3 bg-gray-700 rounded-full overflow-hidden">
-          <div 
+        <div className="h-2 md:h-3 bg-gray-700 rounded-full overflow-hidden">
+          <div
             className={`h-full transition-all duration-500 ${
               riskPercent > 80 ? 'bg-red-500' : riskPercent > 50 ? 'bg-yellow-500' : 'bg-green-500'
             }`}
@@ -1077,16 +1121,16 @@ function App() {
       </div>
 
       {/* Main Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
         {/* Watchlist */}
-        <div className="bg-sentinel-card rounded-xl border border-sentinel-border">
-          <div className="p-4 border-b border-sentinel-border">
-            <h2 className="font-semibold flex items-center gap-2">
-              <TrendingUp className="w-5 h-5 text-blue-400" />
+        <div className="bg-sentinel-card rounded-xl border border-sentinel-border order-2 lg:order-1">
+          <div className="p-3 md:p-4 border-b border-sentinel-border">
+            <h2 className="font-semibold flex items-center gap-2 text-sm md:text-base">
+              <TrendingUp className="w-4 h-4 md:w-5 md:h-5 text-blue-400" />
               Watchlist
             </h2>
           </div>
-          <div className="p-4 space-y-2">
+          <div className="p-2 md:p-4 space-y-1 md:space-y-2 max-h-64 md:max-h-none overflow-y-auto">
             {status?.watchlist?.map(ticker => (
               <WatchlistItem
                 key={ticker}
@@ -1102,28 +1146,28 @@ function App() {
         </div>
 
         {/* Selected Ticker Details */}
-        <div className="lg:col-span-2 space-y-6">
+        <div className="lg:col-span-2 space-y-4 md:space-y-6 order-1 lg:order-2">
           {/* Ticker Info */}
-          <div className="bg-sentinel-card rounded-xl border border-sentinel-border p-4">
-            <div className="flex items-center justify-between mb-4">
+          <div className="bg-sentinel-card rounded-xl border border-sentinel-border p-3 md:p-4">
+            <div className="flex items-center justify-between mb-3 md:mb-4">
               <div>
-                <h2 className="text-xl font-bold">{selectedTicker}</h2>
-                <p className="text-3xl font-mono text-blue-400">
+                <h2 className="text-lg md:text-xl font-bold">{selectedTicker}</h2>
+                <p className="text-2xl md:text-3xl font-mono text-blue-400">
                   ₹{(status?.prices?.[selectedTicker] || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                 </p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex gap-1 md:gap-2">
                 <button
                   onClick={() => executeTrade(selectedTicker, 'BUY')}
                   disabled={!status?.running}
-                  className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded-lg transition"
+                  className="px-3 md:px-4 py-1.5 md:py-2 text-sm bg-green-600 hover:bg-green-700 disabled:opacity-50 rounded-lg transition"
                 >
                   Buy
                 </button>
                 <button
                   onClick={() => closePosition(selectedTicker)}
                   disabled={!positions.some(p => p.ticker === selectedTicker)}
-                  className="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-lg transition"
+                  className="px-3 md:px-4 py-1.5 md:py-2 text-sm bg-red-600 hover:bg-red-700 disabled:opacity-50 rounded-lg transition"
                 >
                   Close
                 </button>
@@ -1133,22 +1177,22 @@ function App() {
             {/* Indicators */}
             {signals[selectedTicker]?.indicators && (
               <div className="grid grid-cols-4 gap-4">
-                <IndicatorBox 
-                  label="Price" 
-                  value={signals[selectedTicker].indicators.price?.toFixed(2)} 
+                <IndicatorBox
+                  label="Price"
+                  value={signals[selectedTicker].indicators.price?.toFixed(2)}
                 />
-                <IndicatorBox 
-                  label="VWAP" 
+                <IndicatorBox
+                  label="VWAP"
                   value={signals[selectedTicker].indicators.vwap?.toFixed(2)}
                   highlight={signals[selectedTicker].indicators.price > signals[selectedTicker].indicators.vwap}
                 />
-                <IndicatorBox 
-                  label="RSI(14)" 
+                <IndicatorBox
+                  label="RSI(14)"
                   value={signals[selectedTicker].indicators.rsi?.toFixed(1)}
                   highlight={signals[selectedTicker].indicators.rsi > 60}
                 />
-                <IndicatorBox 
-                  label="EMA(20)" 
+                <IndicatorBox
+                  label="EMA(20)"
                   value={signals[selectedTicker].indicators.ema20?.toFixed(2)}
                   highlight={signals[selectedTicker].indicators.price > signals[selectedTicker].indicators.ema20}
                 />
@@ -1254,7 +1298,7 @@ function StatCard({ title, value, icon, trend, subtitle }) {
 // Component: Watchlist Item
 function WatchlistItem({ ticker, price, selected, onClick, hasPosition, signal }) {
   return (
-    <div 
+    <div
       onClick={onClick}
       className={`flex items-center justify-between p-3 rounded-lg cursor-pointer transition ${
         selected ? 'bg-blue-500/20 border border-blue-500/50' : 'hover:bg-gray-700/50'
@@ -1286,7 +1330,7 @@ function IndicatorBox({ label, value, highlight }) {
 function PositionRow({ position, onClose }) {
   const pnl = position.unrealized_pnl || 0;
   const isProfit = pnl >= 0;
-  
+
   return (
     <div className="flex items-center justify-between p-3 bg-gray-700/30 rounded-lg">
       <div>
@@ -1369,7 +1413,7 @@ function NewsPanel({ ticker, apiBase }) {
     setLoading(true);
     setError(null);
     try {
-      const url = refresh 
+      const url = refresh
         ? `${apiBase}/news/${ticker}/refresh`
         : `${apiBase}/news/${ticker}?limit=10`;
       const res = await fetch(url, { method: refresh ? 'POST' : 'GET' });
@@ -1396,7 +1440,7 @@ function NewsPanel({ ticker, apiBase }) {
     const diffMs = now - date;
     const diffMins = Math.floor(diffMs / 60000);
     const diffHours = Math.floor(diffMins / 60);
-    
+
     if (diffMins < 60) return `${diffMins}m ago`;
     if (diffHours < 24) return `${diffHours}h ago`;
     return date.toLocaleDateString();
@@ -1417,7 +1461,7 @@ function NewsPanel({ ticker, apiBase }) {
             {toggling ? '...' : (sourceType === 'real' ? 'Live RSS' : 'Mock')}
           </button>
         </div>
-        <button 
+        <button
           onClick={() => fetchNews(true)}
           disabled={loading}
           className="flex items-center gap-1 text-gray-400 hover:text-white disabled:opacity-50"
@@ -1444,9 +1488,9 @@ function NewsPanel({ ticker, apiBase }) {
           <div className="space-y-3">
             {news.map((item, i) => (
               <div key={i} className="p-3 bg-gray-700/30 rounded-lg hover:bg-gray-700/50 transition">
-                <a 
-                  href={item.link} 
-                  target="_blank" 
+                <a
+                  href={item.link}
+                  target="_blank"
                   rel="noopener noreferrer"
                   className="text-sm font-medium hover:text-blue-400 transition"
                 >

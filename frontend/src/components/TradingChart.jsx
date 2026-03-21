@@ -179,24 +179,65 @@ const TradingChart = ({
     }
   }, [indicators]);
 
+  // Helper function to find closest candle timestamp
+  const findClosestCandleTime = (targetTime, candleData) => {
+    if (!candleData || candleData.length === 0) return null;
+    
+    // Get all valid candle times
+    const candleTimes = candleData
+      .map(c => c.time || (typeof c.timestamp === 'string' 
+        ? Math.floor(new Date(c.timestamp).getTime() / 1000)
+        : c.timestamp))
+      .filter(t => t && !isNaN(t))
+      .sort((a, b) => a - b);
+    
+    if (candleTimes.length === 0) return null;
+    
+    // Find closest time
+    let closest = candleTimes[0];
+    let minDiff = Math.abs(targetTime - closest);
+    
+    for (const time of candleTimes) {
+      const diff = Math.abs(targetTime - time);
+      if (diff < minDiff) {
+        minDiff = diff;
+        closest = time;
+      }
+    }
+    
+    return closest;
+  };
+
   // Add position markers
   useEffect(() => {
-    if (!candleSeriesRef.current || !position) return;
+    if (!candleSeriesRef.current || !position || candles.length === 0) return;
 
     const markers = [];
 
     if (position.entry_price) {
-      // Add entry marker
-      const lastCandle = candles[candles.length - 1];
-      markers.push({
-        time: position.entry_time 
-          ? Math.floor(new Date(position.entry_time).getTime() / 1000)
-          : (lastCandle?.time || lastCandle?.timestamp),
-        position: 'belowBar',
-        color: '#00ff00',
-        shape: 'arrowUp',
-        text: `Entry ₹${position.entry_price.toFixed(2)}`,
-      });
+      // Calculate target time from entry_time or use last candle
+      let targetTime;
+      if (position.entry_time) {
+        targetTime = Math.floor(new Date(position.entry_time).getTime() / 1000);
+      } else {
+        const lastCandle = candles[candles.length - 1];
+        targetTime = lastCandle?.time || (typeof lastCandle?.timestamp === 'string'
+          ? Math.floor(new Date(lastCandle.timestamp).getTime() / 1000)
+          : lastCandle?.timestamp);
+      }
+      
+      // Snap to closest existing candle timestamp to prevent chart errors
+      const snappedTime = findClosestCandleTime(targetTime, candles);
+      
+      if (snappedTime) {
+        markers.push({
+          time: snappedTime,
+          position: 'belowBar',
+          color: '#00ff00',
+          shape: 'arrowUp',
+          text: `Entry ₹${position.entry_price.toFixed(2)}`,
+        });
+      }
     }
 
     // Add price lines for SL/TP

@@ -6,6 +6,8 @@ const AIReasoningPanel = ({ ticker, onConfluenceUpdate }) => {
   const [sentimentData, setSentimentData] = useState(null);
   const [reasoning, setReasoning] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [activeTrades, setActiveTrades] = useState([]);
+  const [expandedTrade, setExpandedTrade] = useState(null);
   const reasoningEndRef = useRef(null);
 
   useEffect(() => {
@@ -13,12 +15,45 @@ const AIReasoningPanel = ({ ticker, onConfluenceUpdate }) => {
       fetchConfluence();
       fetchSentiment();
     }
+    // Fetch active trades on mount and periodically
+    fetchActiveTrades();
+    const interval = setInterval(fetchActiveTrades, 30000);
+    return () => clearInterval(interval);
   }, [ticker]);
 
   useEffect(() => {
     // Auto-scroll reasoning log
     reasoningEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [reasoning]);
+
+  const fetchActiveTrades = async () => {
+    try {
+      const [positionsRes, tradesRes] = await Promise.all([
+        fetch('/api/positions'),
+        fetch('/api/trades?limit=10')
+      ]);
+      const positions = await positionsRes.json();
+      const trades = await tradesRes.json();
+      
+      // Merge position data with trade entry details
+      const activeWithDetails = (positions.positions || []).map(pos => {
+        const tradeDetail = (trades.trades || []).find(t => 
+          t.ticker === pos.ticker && !t.exit_time
+        );
+        return {
+          ...pos,
+          entry_reason: tradeDetail?.entry_reason || 'Signal triggered',
+          sentiment_score: tradeDetail?.sentiment_score,
+          chart_safety: tradeDetail?.chart_safety,
+          entry_time: tradeDetail?.entry_time || pos.entry_time
+        };
+      });
+      
+      setActiveTrades(activeWithDetails);
+    } catch (error) {
+      console.error('Failed to fetch active trades:', error);
+    }
+  };
 
   const fetchSentiment = async () => {
     if (!ticker) return;
@@ -232,9 +267,101 @@ const AIReasoningPanel = ({ ticker, onConfluenceUpdate }) => {
         </div>
       )}
 
+      {/* Active Trades Accordion - Entry Reasoning Timeline */}
+      {activeTrades.length > 0 && (
+        <div className="mt-4">
+          <div className="text-sm text-slate-400 mb-2 flex items-center gap-2">
+            <span>📊</span>
+            Active Trades ({activeTrades.length})
+          </div>
+          <div className="space-y-2">
+            {activeTrades.map((trade, index) => (
+              <div 
+                key={trade.ticker || index}
+                className="bg-slate-900/50 rounded-lg border border-slate-700 overflow-hidden"
+              >
+                {/* Accordion Header */}
+                <button
+                  onClick={() => setExpandedTrade(expandedTrade === trade.ticker ? null : trade.ticker)}
+                  className="w-full px-3 py-2 flex items-center justify-between hover:bg-slate-800/50 transition-colors"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2 h-2 rounded-full ${
+                      (trade.pnl || 0) >= 0 ? 'bg-green-500' : 'bg-red-500'
+                    }`} />
+                    <span className="font-medium text-white text-sm">{trade.ticker}</span>
+                    <span className={`text-xs ${
+                      (trade.pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'
+                    }`}>
+                      {(trade.pnl || 0) >= 0 ? '+' : ''}{trade.pnl?.toFixed(2) || '0.00'}
+                    </span>
+                  </div>
+                  <span className="text-slate-400 text-xs">
+                    {expandedTrade === trade.ticker ? '▲' : '▼'}
+                  </span>
+                </button>
+                
+                {/* Accordion Content - AI Reasoning Details */}
+                {expandedTrade === trade.ticker && (
+                  <div className="px-3 pb-3 pt-1 border-t border-slate-700/50 text-xs space-y-2">
+                    {/* Entry Reason */}
+                    <div>
+                      <span className="text-slate-500">Entry Reason:</span>
+                      <p className="text-slate-300 mt-0.5">{trade.entry_reason || 'N/A'}</p>
+                    </div>
+                    
+                    {/* Sentiment Score */}
+                    <div className="flex items-center gap-2">
+                      <span className="text-slate-500">Sentiment:</span>
+                      <span className={`font-medium ${
+                        (trade.sentiment_score || 0) > 0 ? 'text-green-400' : 
+                        (trade.sentiment_score || 0) < 0 ? 'text-red-400' : 'text-yellow-400'
+                      }`}>
+                        {trade.sentiment_score?.toFixed(2) || 'N/A'}
+                      </span>
+                    </div>
+                    
+                    {/* Chart Safety */}
+                    <div className="flex items-center gap-2">
+                      <span className="text-slate-500">Chart Safety:</span>
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                        trade.chart_safety === 'SAFE' ? 'bg-green-500/20 text-green-400' :
+                        trade.chart_safety === 'RISKY' ? 'bg-red-500/20 text-red-400' :
+                        'bg-slate-600 text-slate-300'
+                      }`}>
+                        {trade.chart_safety || 'N/A'}
+                      </span>
+                    </div>
+                    
+                    {/* Entry Details */}
+                    <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-700/30">
+                      <div>
+                        <span className="text-slate-500">Qty:</span>
+                        <span className="text-slate-300 ml-1">{trade.quantity || 'N/A'}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">Avg:</span>
+                        <span className="text-slate-300 ml-1">₹{trade.avg_price?.toFixed(2) || 'N/A'}</span>
+                      </div>
+                    </div>
+                    
+                    {/* Entry Time */}
+                    {trade.entry_time && (
+                      <div className="text-slate-500 text-[10px]">
+                        Entered: {new Date(trade.entry_time).toLocaleString()}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Refresh Button */}
       <button
-        onClick={fetchConfluence}
+        onClick={() => { fetchConfluence(); fetchActiveTrades(); }}
         disabled={loading || !ticker}
         className="mt-4 w-full py-2 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 
                    text-white rounded-lg text-sm transition-colors"

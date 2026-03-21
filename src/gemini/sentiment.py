@@ -1,14 +1,23 @@
 """
 Gemini Sentiment Analysis Module (Feature A: Vibe-Weighted Entry).
 Analyzes news headlines to provide sentiment scoring for trading decisions.
+
+Upgraded to google-genai SDK with:
+- Async client for parallel processing
+- Pydantic structured outputs (no manual JSON parsing)
+- System instructions for cleaner prompts
 """
-import google.generativeai as genai
-from typing import List, Optional, Dict, Tuple
-import json
-import re
+import asyncio
+import os
 import time
 import logging
+from typing import List, Tuple
 from dataclasses import dataclass
+
+from google import genai
+from google.genai import types
+
+from .models import SentimentResponse, RecommendationType
 
 logger = logging.getLogger(__name__)
 
@@ -27,49 +36,37 @@ class SentimentResult:
 
 class SentimentAnalyzer:
     """
-    Analyzes news sentiment using Gemini 2.0 Flash.
-    Provides sentiment scores for trading gate decisions.
+    Analyzes news sentiment using Gemini 2.5 Flash.
+    Uses google-genai SDK with Pydantic structured outputs.
     """
     
-    SENTIMENT_PROMPT = """You are a financial sentiment analyst for Indian stock markets. 
-Analyze the following news headlines for {ticker} and provide a sentiment assessment.
+    SYSTEM_INSTRUCTION = """You are a financial sentiment analyst for Indian stock markets.
+Your role is to analyze news headlines and assess market sentiment for trading decisions.
 
-HEADLINES:
-{headlines}
+Focus on:
+- Earnings reports, regulatory news, business expansion, competitive threats
+- Weight recent news more heavily than older news
+- Consider both direct company news and sector-wide implications
 
-INSTRUCTIONS:
-1. Focus on earnings reports, regulatory news, business expansion, and competitive threats
-2. Ignore noise like price movements, analyst ratings, and routine announcements
-3. Weight recent news more heavily than older news
-4. Consider both direct company news and sector-wide implications
+Ignore:
+- Price movements, analyst ratings, routine announcements
 
-Respond in this exact JSON format:
-{{
-    "sentiment_score": <float between -1.0 and 1.0>,
-    "confidence": <float between 0.0 and 1.0>,
-    "reasoning": "<brief 1-2 sentence explanation>",
-    "key_factors": ["<factor1>", "<factor2>"],
-    "recommendation": "<BULLISH|BEARISH|NEUTRAL>"
-}}
-
-SCORING GUIDE:
+Scoring Guide:
 - 1.0: Extremely positive (major earnings beat, regulatory approval, big contract win)
 - 0.5: Moderately positive (good results, expansion news)
 - 0.0: Neutral (routine news, mixed signals)
 - -0.5: Moderately negative (earnings miss, management issues)
-- -1.0: Extremely negative (regulatory action, fraud, major loss)
+- -1.0: Extremely negative (regulatory action, fraud, major loss)"""
 
-Return ONLY the JSON, no additional text."""
-
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: str = None, model: str = "gemini-2.5-flash"):
         """
         Initialize the sentiment analyzer.
         
         Args:
-            api_key: Google Gemini API key
+            api_key: Google Gemini API key (or uses GEMINI_API_KEY env var)
             model: Gemini model to use
         """
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model_name = model
         self._setup_client()
         
@@ -82,10 +79,9 @@ Return ONLY the JSON, no additional text."""
         self.retry_delay = 2.0
     
     def _setup_client(self):
-        """Configure the Gemini client."""
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(self.model_name)
-        logger.info(f"Gemini sentiment analyzer initialized with {self.model_name}")
+        """Configure the Gemini client with async support."""
+        self.client = genai.Client(api_key=self.api_key)
+        logger.info(f"Gemini sentiment analyzer initialized with {self.model_name} (new SDK)")
     
     def _rate_limit(self):
         """Enforce rate limiting between requests."""
@@ -94,32 +90,12 @@ Return ONLY the JSON, no additional text."""
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
     
-    def _parse_response(self, response_text: str) -> Dict:
-        """Parse JSON from Gemini response."""
-        # Try to extract JSON from response
-        try:
-            # Direct parse
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            pass
-        
-        # Try to find JSON in markdown code block
-        json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                pass
-        
-        # Try to find JSON object directly
-        json_match = re.search(r'\{[\s\S]*\}', response_text)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
-        
-        raise ValueError(f"Could not parse JSON from response: {response_text[:200]}")
+    async def _rate_limit_async(self):
+        """Async rate limiting."""
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self._min_request_interval:
+            await asyncio.sleep(self._min_request_interval - elapsed)
+        self._last_request_time = time.time()
     
     def analyze(self, ticker: str, headlines: List[str]) -> SentimentResult:
         """
@@ -147,34 +123,43 @@ Return ONLY the JSON, no additional text."""
         # Prepare headlines (numbered for clarity)
         headlines_text = "\n".join([f"{i+1}. {h}" for i, h in enumerate(headlines[:10])])
         
-        prompt = self.SENTIMENT_PROMPT.format(
-            ticker=ticker,
-            headlines=headlines_text
-        )
+        prompt = f"""Analyze the following news headlines for {ticker} and provide a sentiment assessment.
+
+HEADLINES:
+{headlines_text}
+
+Provide your analysis."""
         
-        # Make request with retries
+        # Make request with retries using Pydantic structured output
         for attempt in range(self.max_retries):
             try:
                 self._rate_limit()
                 
-                response = self.model.generate_content(prompt)
-                result = self._parse_response(response.text)
+                # Use structured output with Pydantic model - no JSON parsing needed
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=SentimentResponse,
+                    )
+                )
                 
-                # Validate and clamp values
-                score = max(-1.0, min(1.0, float(result.get('sentiment_score', 0))))
-                confidence = max(0.0, min(1.0, float(result.get('confidence', 0.5))))
+                # Parse structured response directly
+                result = SentimentResponse.model_validate_json(response.text)
                 
                 sentiment_result = SentimentResult(
                     ticker=ticker,
-                    score=score,
-                    confidence=confidence,
-                    reasoning=result.get('reasoning', 'No reasoning provided'),
-                    key_factors=result.get('key_factors', []),
-                    recommendation=result.get('recommendation', 'NEUTRAL'),
+                    score=result.sentiment_score,
+                    confidence=result.confidence,
+                    reasoning=result.reasoning,
+                    key_factors=result.key_factors,
+                    recommendation=result.recommendation.value,
                     headlines_analyzed=len(headlines)
                 )
                 
-                logger.info(f"Sentiment for {ticker}: {score:.2f} ({sentiment_result.recommendation})")
+                logger.info(f"Sentiment for {ticker}: {result.sentiment_score:.2f} ({result.recommendation.value})")
                 return sentiment_result
                 
             except Exception as e:
@@ -183,6 +168,78 @@ Return ONLY the JSON, no additional text."""
                     time.sleep(self.retry_delay * (attempt + 1))
                 else:
                     logger.error(f"All sentiment analysis attempts failed for {ticker}")
+                    return SentimentResult(
+                        ticker=ticker,
+                        score=0.0,
+                        confidence=0.0,
+                        reasoning=f"Analysis failed: {str(e)}",
+                        key_factors=[],
+                        recommendation="NEUTRAL",
+                        headlines_analyzed=len(headlines)
+                    )
+    
+    async def analyze_async(self, ticker: str, headlines: List[str]) -> SentimentResult:
+        """
+        Async version of sentiment analysis for parallel processing.
+        
+        Args:
+            ticker: Stock ticker symbol
+            headlines: List of recent news headlines
+            
+        Returns:
+            SentimentResult with score and analysis
+        """
+        if not headlines:
+            return SentimentResult(
+                ticker=ticker,
+                score=0.0,
+                confidence=0.0,
+                reasoning="No news headlines available for analysis",
+                key_factors=[],
+                recommendation="NEUTRAL",
+                headlines_analyzed=0
+            )
+        
+        headlines_text = "\n".join([f"{i+1}. {h}" for i, h in enumerate(headlines[:10])])
+        prompt = f"""Analyze the following news headlines for {ticker} and provide a sentiment assessment.
+
+HEADLINES:
+{headlines_text}
+
+Provide your analysis."""
+        
+        for attempt in range(self.max_retries):
+            try:
+                await self._rate_limit_async()
+                
+                # Async call with structured output
+                response = await self.client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=SentimentResponse,
+                    )
+                )
+                
+                result = SentimentResponse.model_validate_json(response.text)
+                
+                return SentimentResult(
+                    ticker=ticker,
+                    score=result.sentiment_score,
+                    confidence=result.confidence,
+                    reasoning=result.reasoning,
+                    key_factors=result.key_factors,
+                    recommendation=result.recommendation.value,
+                    headlines_analyzed=len(headlines)
+                )
+                
+            except Exception as e:
+                logger.warning(f"Async sentiment analysis attempt {attempt+1} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (attempt + 1))
+                else:
                     return SentimentResult(
                         ticker=ticker,
                         score=0.0,
