@@ -24,7 +24,10 @@
       "Bash(cmd.exe /c \"taskkill /PID 2960 /F 2>&1\")",
       "Bash(powershell -Command \"Stop-Process -Id 2960 -Force -ErrorAction SilentlyContinue; Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force\")",
       "Bash(curl -s -X POST http://localhost:8000/api/holdings/RELIANCE/trading-permission -H \"Content-Type: application/json\" -d \"{\"\"allowed\"\": false}\")",
-      "Bash(curl -s \"http://localhost:8000/api/watchlist/suggestions?force=true\" -m 10)"
+      "Bash(curl -s \"http://localhost:8000/api/watchlist/suggestions?force=true\" -m 10)",
+      "Bash(/c/Users/Sree/Documents/GitHub/sentinel/venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\(''src/ingestion/news_scraper.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Read(//c/Users/Sree/AppData/Local/Temp/claude/c--Users-Sree-Documents-GitHub-sentinel/4164e4c0-50a0-49a9-a7c7-291b1080f182/tasks/**)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/ingestion/news_scraper.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")"
     ]
   }
 }
