@@ -17,7 +17,14 @@
       "Bash(curl -s http://localhost:8000/api/settings/risk)",
       "Bash(curl -s -X POST http://localhost:8000/api/settings/risk -H \"Content-Type: application/json\" -d '{\"\"take_profit_pct\"\": 0.025, \"\"stop_loss_pct\"\": 0.012, \"\"risk_per_trade\"\": 750}')",
       "Bash(curl -s http://localhost:3000)",
-      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000)"
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000)",
+      "Bash(curl -s http://localhost:8000/api/holdings)",
+      "Bash(python3 -c \":*)",
+      "Bash(cmd.exe /c \"taskkill /PID 2960 /F\")",
+      "Bash(cmd.exe /c \"taskkill /PID 2960 /F 2>&1\")",
+      "Bash(powershell -Command \"Stop-Process -Id 2960 -Force -ErrorAction SilentlyContinue; Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(curl -s -X POST http://localhost:8000/api/holdings/RELIANCE/trading-permission -H \"Content-Type: application/json\" -d \"{\"\"allowed\"\": false}\")",
+      "Bash(curl -s \"http://localhost:8000/api/watchlist/suggestions?force=true\" -m 10)"
     ]
   }
 }

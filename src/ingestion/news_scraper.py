@@ -68,26 +68,57 @@ class NewsScraper:
     
     # Keyword mappings for stock identification
     TICKER_KEYWORDS = {
-        "RELIANCE": ["reliance", "ril", "mukesh ambani", "jio", "reliance industries", "reliance retail"],
-        "ICICIBANK": ["icici bank", "icici", "icicibank"],
-        "TCS": ["tcs", "tata consultancy", "tata consulting", "tata tech"],
-        "INFY": ["infosys", "infy", "narayana murthy", "salil parekh"],
-        "HDFCBANK": ["hdfc bank", "hdfcbank", "hdfc"],
-        "HINDUNILVR": ["hindustan unilever", "hul", "hindunilvr", "unilever india"],
-        "SBIN": ["sbi", "state bank", "sbin", "state bank of india"],
-        "BHARTIARTL": ["bharti airtel", "airtel", "bhartiartl", "sunil mittal"],
-        "KOTAKBANK": ["kotak", "kotak mahindra", "kotakbank", "uday kotak"],
-        "ITC": ["itc", "itc limited", "itc hotels"],
-        "JSWSTEEL": ["jsw steel", "jswsteel", "jsw"],
-        "TATAMOTORS": ["tata motors", "tatamotors", "tata auto"],
-        "WIPRO": ["wipro", "azim premji"],
-        "HCLTECH": ["hcl tech", "hcltech", "hcl technologies"],
-        "MARUTI": ["maruti", "maruti suzuki", "msil"],
-        "AXISBANK": ["axis bank", "axisbank"],
-        "SUNPHARMA": ["sun pharma", "sunpharma", "sun pharmaceutical"],
-        "TITAN": ["titan", "titan company", "tanishq"],
-        "BAJFINANCE": ["bajaj finance", "bajfinance"],
-        "ADANIENT": ["adani", "adani enterprises", "adanient", "gautam adani"],
+        # --- Nifty 50 complete coverage ---
+        "RELIANCE":    ["reliance", "ril", "mukesh ambani", "jio", "reliance industries", "reliance retail"],
+        "TCS":         ["tcs", "tata consultancy", "tata consulting"],
+        "HDFCBANK":    ["hdfc bank", "hdfcbank", "hdfc"],
+        "ICICIBANK":   ["icici bank", "icici", "icicibank"],
+        "INFY":        ["infosys", "infy", "narayana murthy", "salil parekh"],
+        "HINDUNILVR":  ["hindustan unilever", "hul", "hindunilvr", "unilever india"],
+        "SBIN":        ["sbi", "state bank", "sbin", "state bank of india"],
+        "BHARTIARTL":  ["bharti airtel", "airtel", "bhartiartl", "sunil mittal"],
+        "KOTAKBANK":   ["kotak", "kotak mahindra", "kotakbank", "uday kotak"],
+        "ITC":         ["itc", "itc limited", "itc hotels"],
+        "LT":          ["larsen", "l&t", "larsen and toubro", "lt construction"],
+        "AXISBANK":    ["axis bank", "axisbank"],
+        "ASIANPAINT":  ["asian paints", "asianpaint"],
+        "MARUTI":      ["maruti", "maruti suzuki", "msil"],
+        "SUNPHARMA":   ["sun pharma", "sunpharma", "sun pharmaceutical"],
+        "TITAN":       ["titan", "titan company", "tanishq"],
+        "ULTRACEMCO":  ["ultratech", "ultratech cement", "ultracemco"],
+        "BAJFINANCE":  ["bajaj finance", "bajfinance"],
+        "WIPRO":       ["wipro", "azim premji"],
+        "HCLTECH":     ["hcl tech", "hcltech", "hcl technologies"],
+        "ONGC":        ["ongc", "oil and natural gas", "oil india"],
+        "NTPC":        ["ntpc", "national thermal power"],
+        "POWERGRID":   ["power grid", "powergrid", "pgcil"],
+        "TATASTEEL":   ["tata steel", "tatasteel"],
+        "JSWSTEEL":    ["jsw steel", "jswsteel", "jsw"],
+        "ADANIENT":    ["adani enterprises", "adanient", "gautam adani"],
+        "ADANIPORTS":  ["adani ports", "adaniports", "mundra port"],
+        "BAJAJ-AUTO":  ["bajaj auto", "bajaj motorcycle", "bajaj bike"],
+        "BAJAJFINSV":  ["bajaj finserv", "bajajfinsv"],
+        "BPCL":        ["bpcl", "bharat petroleum"],
+        "BRITANNIA":   ["britannia", "britannia industries"],
+        "CIPLA":       ["cipla"],
+        "COALINDIA":   ["coal india", "coalindia"],
+        "DIVISLAB":    ["divi's", "divis laboratories", "divislab"],
+        "DRREDDY":     ["dr reddy", "dr. reddy", "drreddy"],
+        "EICHERMOT":   ["eicher", "royal enfield", "eichermot"],
+        "GRASIM":      ["grasim", "aditya birla"],
+        "HDFCLIFE":    ["hdfc life", "hdfclife"],
+        "HEROMOTOCO":  ["hero motocorp", "hero motorcycle", "heromotoco"],
+        "HINDALCO":    ["hindalco", "hindustan copper", "novelis"],
+        "INDUSINDBK":  ["indusind bank", "indusindbk"],
+        "M&M":         ["mahindra", "m&m", "mahindra and mahindra"],
+        "NESTLEIND":   ["nestle", "nestleind", "nestle india"],
+        "SBILIFE":     ["sbi life", "sbilife"],
+        "SHREECEM":    ["shree cement", "shreecem"],
+        "TATACONSUM":  ["tata consumer", "tataconsum", "tata tea", "tata salt"],
+        "TATAMOTORS":  ["tata motors", "tatamotors", "jaguar land rover", "jlr"],
+        "TECHM":       ["tech mahindra", "techm"],
+        "APOLLOHOSP":  ["apollo hospital", "apollohosp"],
+        "UPL":         ["upl", "united phosphorus"],
     }
     
     def __init__(self, feeds: List[tuple] = None, watchlist: List[str] = None, cache_ttl: int = None):
@@ -209,10 +240,12 @@ class NewsScraper:
     def fetch_news(self, force: bool = False) -> List[NewsItem]:
         """
         Fetch news from all configured RSS feeds.
-        
+
         Args:
-            force: Force fetch even if within minimum interval
-            
+            force: Force fetch even if within minimum interval.
+                   Also clears seen-headlines so previously fetched articles
+                   are re-processed (prevents the cache from going stale).
+
         Returns:
             List of NewsItem objects
         """
@@ -222,9 +255,14 @@ class NewsScraper:
             if cache_age < self.cache_ttl and self._all_news_cache:
                 logger.debug(f"Returning {len(self._all_news_cache)} cached news items (age: {cache_age:.0f}s)")
                 return self._all_news_cache
-        
+
+        # Clear dedup set on forced refresh so we re-process the same headlines
+        if force:
+            self._seen_headlines.clear()
+            self._cache.clear()
+
         all_items = []
-        
+
         for source_name, url in self.feeds:
             # Check if we should skip due to rate limiting
             last_fetch = self._last_fetch_time.get(url)
@@ -232,23 +270,22 @@ class NewsScraper:
                 if datetime.now() - last_fetch < self._min_fetch_interval:
                     logger.debug(f"Skipping {source_name}: too soon since last fetch")
                     continue
-            
+
             logger.info(f"Fetching news from {source_name}")
             items = self._parse_feed(source_name, url)
             all_items.extend(items)
-            
+
             self._last_fetch_time[url] = datetime.now()
-            
+
             # Be nice to servers
             time.sleep(0.5)
-        
+
         # Sort by timestamp (newest first)
         all_items.sort(key=lambda x: x.timestamp, reverse=True)
-        
-        # Update global cache
-        if all_items:
-            self._all_news_cache = all_items
-            self._all_news_cache_time = datetime.now()
+
+        # Always update cache (even if empty, so callers know a fetch was attempted)
+        self._all_news_cache = all_items
+        self._all_news_cache_time = datetime.now()
         
         logger.info(f"Fetched {len(all_items)} relevant news items")
         return all_items

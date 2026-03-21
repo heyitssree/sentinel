@@ -428,6 +428,18 @@ class RealKite:
         if self._kite:
             return self._kite.instruments(exchange)
         return []
+
+    def holdings(self) -> List[Dict]:
+        """Get Demat holdings (long-term CNC positions)."""
+        if self._kite:
+            return self._kite.holdings()
+        return []
+
+    def positions(self) -> Dict:
+        """Get intraday / F&O positions."""
+        if self._kite:
+            return self._kite.positions()
+        return {"net": [], "day": []}
     
     def is_configured(self) -> bool:
         """Check if Kite is properly configured."""

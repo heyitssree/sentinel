@@ -169,9 +169,38 @@ class SentinelEngine:
         self.prices = {ticker: 0.0 for ticker in self.portfolio.get_watchlist()}
         self._trading_task = None
         self._last_analysis = {}
+
+        # Per-ticker trading permission (True = engine may trade it, False = skip)
+        self._permissions_file = Path("data/trading_permissions.json")
+        self._trading_permissions: Dict[str, bool] = self._load_permissions()
+
         self._initialized = True
-        
+
         logger.info(f"Engine initialized. Watchlist: {self.portfolio.get_watchlist()}")
+
+    def _load_permissions(self) -> Dict[str, bool]:
+        """Load trading permissions from file."""
+        if self._permissions_file.exists():
+            try:
+                return json.loads(self._permissions_file.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_permissions(self):
+        """Persist trading permissions to file."""
+        self._permissions_file.parent.mkdir(exist_ok=True)
+        self._permissions_file.write_text(json.dumps(self._trading_permissions))
+
+    def is_trading_allowed(self, ticker: str) -> bool:
+        """Return True if the engine is permitted to trade this ticker (default True)."""
+        return self._trading_permissions.get(ticker, True)
+
+    def set_trading_permission(self, ticker: str, allowed: bool):
+        """Enable or disable trading for a ticker."""
+        self._trading_permissions[ticker] = allowed
+        self._save_permissions()
+        logger.info(f"Trading {'enabled' if allowed else 'disabled'} for {ticker}")
     
     def get_watchlist(self) -> list:
         """Get current watchlist."""
@@ -301,6 +330,11 @@ class SentinelEngine:
     async def _analyze_and_trade(self, ticker: str):
         """Analyze a single ticker and execute trade if conditions met."""
         try:
+            # Skip if user has disabled trading for this ticker
+            if not self.is_trading_allowed(ticker):
+                logger.debug(f"{ticker}: trading disabled by user — skipping")
+                return
+
             # Need 210+ candles for EMA-200 to be reliable
             candles = self.db.get_candles(ticker, limit=250)
 
@@ -437,13 +471,10 @@ class SentinelEngine:
     async def _build_suggestions(self, force: bool = False) -> List[Dict]:
         """
         Scan Nifty 50 stocks and return AI-ranked suggestions.
-        Results are cached for _suggestions_ttl_minutes.
+        Uses Kite LTP/quote for live prices; enriches with candle-based indicators
+        when local data exists. Results are cached for _suggestions_ttl_minutes.
         """
-        try:
-            from config.nifty50 import NIFTY_50
-        except ImportError:
-            from src.trading.portfolio import NIFTY_50 as _nifty_list
-            NIFTY_50 = {t: type('S', (), {'name': t, 'sector': 'Unknown', 'weight': 0})() for t in _nifty_list}
+        from src.trading.portfolio import NIFTY_50 as _nifty_tickers
 
         # Check cache
         if not force and self._suggestions_cache is not None and self._suggestions_cache_time:
@@ -451,49 +482,95 @@ class SentinelEngine:
             if age_min < self._suggestions_ttl_minutes:
                 return self._suggestions_cache
 
-        logger.info("Building watchlist suggestions — scoring Nifty 50...")
+        logger.info("Building watchlist suggestions — fetching live quotes for Nifty 50...")
+
+        # ── Step 1: fetch live prices in bulk ──────────────────────────────────
+        instruments = [f"NSE:{t}" for t in _nifty_tickers]
+        quotes: Dict = {}
+        try:
+            if self.use_real_kite:
+                raw_quotes = self.kite.quote(instruments)
+                quotes = {k.replace("NSE:", ""): v for k, v in raw_quotes.items()}
+            else:
+                # Mock: use whatever prices are cached locally
+                for t in _nifty_tickers:
+                    if t in self.prices and self.prices[t] > 0:
+                        quotes[t] = {"last_price": self.prices[t], "ohlc": {}, "volume": 0, "average_price": self.prices[t]}
+        except Exception as e:
+            logger.warning(f"Suggestions: could not fetch live quotes: {e}")
+
         scored = []
-
-        for ticker in NIFTY_50:
+        for ticker in _nifty_tickers:
             try:
+                q = quotes.get(ticker, {})
+                price = float(q.get("last_price") or q.get("close") or 0)
+                if price <= 0:
+                    # Try local candle last close
+                    candles_fb = self.db.get_candles(ticker, limit=5)
+                    if not candles_fb.empty:
+                        price = float(candles_fb['close'].iloc[-1])
+                if price <= 0:
+                    continue  # no price data at all, skip
+
+                # ── Candle-based indicators (best-effort) ──────────────────
+                rsi = 50.0
+                vwap = price
+                ema20 = price
+                vol_ratio = 1.0
+                vwap_score = 0.5
+                ema_score = 0.5
+
                 candles = self.db.get_candles(ticker, limit=50)
-                if candles.empty or len(candles) < 20:
-                    continue
+                if not candles.empty and len(candles) >= 14:
+                    rsi_series = self.indicators.calculate_rsi(candles, 14)
+                    ema20_series = self.indicators.calculate_ema(candles, 20)
+                    vwap_series = self.indicators.calculate_vwap(candles)
+                    vol_info = self.indicators.get_volume_spike_info(candles)
 
-                rsi_series = self.indicators.calculate_rsi(candles, 14)
-                vwap_series = self.indicators.calculate_vwap(candles)
-                ema20_series = self.indicators.calculate_ema(candles, 20)
-                vol_info = self.indicators.get_volume_spike_info(candles)
+                    if not rsi_series.empty:
+                        rsi = float(rsi_series.iloc[-1])
+                    if not ema20_series.empty:
+                        ema20 = float(ema20_series.iloc[-1])
+                    if not vwap_series.empty:
+                        vwap = float(vwap_series.iloc[-1])
+                    vol_ratio = float(vol_info.get('ratio', 1.0))
 
-                rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else 50.0
-                vwap = float(vwap_series.iloc[-1]) if not vwap_series.empty else 0
-                ema20 = float(ema20_series.iloc[-1]) if not ema20_series.empty else 0
-                price = float(candles['close'].iloc[-1])
-                vol_ratio = float(vol_info.get('ratio', 1.0))
+                    vwap_score = 1.0 if price > vwap > 0 else 0.0
+                    ema_score = 1.0 if price > ema20 > 0 else 0.0
+                elif q:
+                    # Use intraday OHLC for rough momentum
+                    ohlc = q.get("ohlc", {})
+                    day_open = float(ohlc.get("open") or price)
+                    if day_open > 0:
+                        vwap_score = 1.0 if price > day_open else 0.0
+                        ema_score = vwap_score
 
-                # Technical score (0-1)
-                rsi_score = min(max((rsi - 40) / 40, 0), 1)          # bullish if RSI 40-80
-                vwap_score = 1.0 if price > vwap > 0 else 0.0
-                ema_score = 1.0 if price > ema20 > 0 else 0.0
+                # Technical score
+                rsi_score = min(max((rsi - 40) / 40, 0), 1)
                 vol_score = min(vol_ratio / 3.0, 1.0)
-                tech_score = (rsi_score * 0.4 + vwap_score * 0.3 + ema_score * 0.3)
+                tech_score = rsi_score * 0.4 + vwap_score * 0.3 + ema_score * 0.3
 
-                # Sentiment score (0-1, centered from -1..1)
+                # Fast keyword sentiment (no API call — Gemini runs on top-10 only)
                 headlines = self.news_scraper.get_recent_headlines(ticker, limit=5)
+                sentiment_score = 0.5
                 if headlines:
-                    sent = self.sentiment.analyze(ticker, headlines)
-                    sentiment_score = (sent.score + 1) / 2  # map -1..1 → 0..1
-                else:
-                    sentiment_score = 0.5
+                    _pos = {'surge', 'rally', 'gain', 'rise', 'beat', 'strong', 'growth',
+                            'profit', 'bullish', 'upgrade', 'buy', 'record', 'high', 'boost'}
+                    _neg = {'fall', 'drop', 'loss', 'weak', 'miss', 'decline', 'cut',
+                            'bearish', 'downgrade', 'sell', 'low', 'crash', 'concern', 'risk'}
+                    combined_text = ' '.join(headlines).lower()
+                    pos = sum(1 for w in _pos if w in combined_text)
+                    neg = sum(1 for w in _neg if w in combined_text)
+                    total = pos + neg
+                    sentiment_score = (pos / total) if total > 0 else 0.5
 
                 combined = tech_score * 0.4 + sentiment_score * 0.4 + vol_score * 0.2
 
-                stock_info = NIFTY_50[ticker]
                 scored.append({
                     'ticker': ticker,
-                    'name': getattr(stock_info, 'name', ticker),
-                    'sector': getattr(stock_info, 'sector', 'Unknown'),
-                    'price': price,
+                    'name': ticker,
+                    'sector': 'Nifty 50',
+                    'price': round(price, 2),
                     'combined_score': round(combined, 3),
                     'technical_score': round(tech_score, 3),
                     'sentiment_score': round(sentiment_score, 3),
@@ -709,11 +786,69 @@ async def get_portfolio():
 
 @app.get("/api/holdings")
 async def get_holdings():
-    """Get current holdings."""
-    return {
-        "holdings": engine.portfolio.get_holdings(),
-        "count": len(engine.portfolio.portfolio.holdings)
-    }
+    """Get current holdings — real Zerodha demat holdings when connected, else paper portfolio."""
+    permissions = engine._trading_permissions
+
+    if engine.use_real_kite:
+        try:
+            raw = engine.kite.holdings()
+            holdings = []
+            for h in raw:
+                ticker = h.get("tradingsymbol", "")
+                qty = h.get("quantity", 0) + h.get("t1_quantity", 0)
+                avg = h.get("average_price", 0.0)
+                ltp = h.get("last_price", avg)
+                invested = qty * avg
+                current = qty * ltp
+                holdings.append({
+                    "ticker": ticker,
+                    "exchange": h.get("exchange", "NSE"),
+                    "quantity": qty,
+                    "avg_price": round(avg, 2),
+                    "current_price": round(ltp, 2),
+                    "invested_value": round(invested, 2),
+                    "current_value": round(current, 2),
+                    "pnl": round(current - invested, 2),
+                    "pnl_percent": round(((ltp - avg) / avg * 100) if avg else 0, 2),
+                    "day_change": round(h.get("day_change", 0.0), 2),
+                    "day_change_percentage": round(h.get("day_change_percentage", 0.0), 2),
+                    "product": h.get("product", "CNC"),
+                    "isin": h.get("isin", ""),
+                    "trading_allowed": permissions.get(ticker, True),
+                })
+            return {"holdings": holdings, "source": "zerodha", "count": len(holdings)}
+        except Exception as e:
+            logger.warning(f"Could not fetch Zerodha holdings: {e}")
+            # fall through to paper
+
+    # Paper portfolio holdings
+    paper = engine.portfolio.get_holdings()
+    for h in paper:
+        h["trading_allowed"] = permissions.get(h["ticker"], True)
+        h["source"] = "paper"
+        h.setdefault("day_change", 0.0)
+        h.setdefault("day_change_percentage", 0.0)
+        h.setdefault("exchange", "NSE")
+        h.setdefault("product", "PAPER")
+        h.setdefault("isin", "")
+    return {"holdings": paper, "source": "paper", "count": len(paper)}
+
+
+class TradingPermissionRequest(BaseModel):
+    allowed: bool = True
+
+
+@app.post("/api/holdings/{ticker}/trading-permission")
+async def set_holding_trading_permission(ticker: str, body: TradingPermissionRequest):
+    """Enable or disable automated trading for a specific ticker."""
+    allowed = body.allowed
+    engine.set_trading_permission(ticker.upper(), allowed)
+    await manager.broadcast({
+        "type": "trading_permission_changed",
+        "ticker": ticker.upper(),
+        "allowed": allowed,
+    })
+    return {"success": True, "ticker": ticker.upper(), "trading_allowed": allowed}
 
 
 @app.post("/api/portfolio/capital")
@@ -1005,10 +1140,17 @@ async def get_sentiment(ticker: str):
     ticker = ticker.upper()
     
     try:
-        # Fetch recent news for the ticker
+        # Fetch recent news for the ticker; auto-refresh if cache is stale or empty
         news_items = engine.news_scraper.fetch_news_for_ticker(ticker)
         headlines = [item.headline for item in news_items[:10] if item.headline]
-        
+
+        if not headlines:
+            # Cache miss — force a full refresh and retry once
+            logger.info(f"No cached news for {ticker}, triggering fresh fetch...")
+            engine.news_scraper.fetch_news(force=True)
+            news_items = engine.news_scraper.fetch_news_for_ticker(ticker, force=True)
+            headlines = [item.headline for item in news_items[:10] if item.headline]
+
         if not headlines:
             return {
                 "ticker": ticker,
@@ -1847,37 +1989,78 @@ async def zerodha_login():
 
 @app.get("/api/zerodha/callback")
 async def zerodha_callback(request_token: str = None, status: str = None):
-    """Handle Zerodha OAuth callback after login."""
+    """Handle Zerodha OAuth callback after login. Returns an HTML page so the user
+    sees a clear result and the tab can be closed."""
+    from fastapi.responses import HTMLResponse
+
+    def _html(title: str, colour: str, heading: str, body: str) -> HTMLResponse:
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>{title}</title>
+  <style>
+    body{{margin:0;background:#111827;color:#f9fafb;font-family:sans-serif;
+         display:flex;align-items:center;justify-content:center;height:100vh}}
+    .card{{background:#1f2937;border:1px solid #374151;border-radius:12px;
+           padding:2rem 2.5rem;max-width:420px;text-align:center}}
+    .icon{{font-size:3rem;margin-bottom:1rem}}
+    h1{{margin:0 0 .5rem;font-size:1.4rem;color:{colour}}}
+    p{{color:#9ca3af;margin:.5rem 0}}
+    .close{{margin-top:1.5rem;font-size:.85rem;color:#6b7280}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{heading}</div>
+    <h1>{title}</h1>
+    {body}
+    <p class="close">You can close this tab and return to Sentinel.</p>
+  </div>
+  <script>
+    // Auto-close after 4 seconds if opened by script
+    if (window.opener) {{
+      setTimeout(() => window.close(), 4000);
+    }}
+  </script>
+</body>
+</html>"""
+        return HTMLResponse(content=html)
+
     if status == "error" or not request_token:
-        return {"success": False, "error": "Login failed or cancelled"}
-    
+        return _html(
+            "Login Failed", "#ef4444", "✗",
+            "<p>Zerodha login was cancelled or failed.</p><p>Please try again from Sentinel.</p>"
+        )
+
     api_key = os.getenv("KITE_API_KEY", "")
     api_secret = os.getenv("KITE_API_SECRET", "")
-    
+
     if not api_key or not api_secret:
-        return {"success": False, "error": "API credentials not configured"}
-    
+        return _html(
+            "Not Configured", "#f59e0b", "⚠️",
+            "<p>KITE_API_KEY or KITE_API_SECRET is not saved.</p><p>Save them in Sentinel Settings first.</p>"
+        )
+
     try:
-        # Use RealKite which has SSL fix for macOS
         kite = RealKite(api_key=api_key)
-        
-        # Generate access token
         data = kite.generate_session(request_token, api_secret=api_secret)
         access_token = data["access_token"]
-        
-        # Save to .env
+
         set_key(str(ENV_FILE), "KITE_ACCESS_TOKEN", access_token)
         os.environ["KITE_ACCESS_TOKEN"] = access_token
-        
-        # Return success page
-        return {
-            "success": True,
-            "message": f"Logged in as {data.get('user_name', 'Unknown')}",
-            "user_id": data.get("user_id"),
-            "note": "Access token saved. You can close this window."
-        }
+
+        user_name = data.get("user_name", "Unknown")
+        return _html(
+            "Connected!", "#22c55e", "✓",
+            f"<p>Logged in as <strong style='color:#f9fafb'>{user_name}</strong></p>"
+            f"<p>Access token saved to Sentinel.</p>"
+        )
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _html(
+            "Token Exchange Failed", "#ef4444", "✗",
+            f"<p>{str(e)}</p><p>Check your API Secret in Sentinel Settings and try again.</p>"
+        )
 
 
 @app.post("/api/zerodha/postback")

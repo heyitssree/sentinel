@@ -15,6 +15,7 @@ import TechnicalHeatmap from './components/TechnicalHeatmap';
 import TradingChart from './components/TradingChart';
 import DailyAutopsy from './components/DailyAutopsy';
 import WatchlistSuggestions from './components/WatchlistSuggestions';
+import Holdings from './components/Holdings';
 
 const API_BASE = '/api';
 
@@ -30,7 +31,7 @@ function App() {
   const [availableStocks, setAvailableStocks] = useState([]);
   const [capitalInput, setCapitalInput] = useState('');
   const [customTicker, setCustomTicker] = useState('');
-  const [activeView, setActiveView] = useState('dashboard'); // dashboard, heatmap, chart, autopsy, suggestions
+  const [activeView, setActiveView] = useState('dashboard'); // dashboard, heatmap, chart, autopsy, suggestions, holdings
   const [chartData, setChartData] = useState({ candles: [], indicators: {} });
   const [tradingPhase, setTradingPhase] = useState(null);
   const [tradingMode, setTradingMode] = useState('paper'); // "paper" | "live"
@@ -50,6 +51,8 @@ function App() {
   const [testingZerodha, setTestingZerodha] = useState(false);
   const [geminiTestResult, setGeminiTestResult] = useState(null);
   const [zerodhaTestResult, setZerodhaTestResult] = useState(null);
+  // Zerodha daily OAuth flow
+  const [zerodhaAuthResult, setZerodhaAuthResult] = useState(null); // {success, error} for login-url step
 
   // Fetch initial data
   const fetchData = useCallback(async () => {
@@ -352,6 +355,23 @@ function App() {
     }
     setTestingZerodha(false);
   };
+
+  // Zerodha daily OAuth: open login URL in new tab
+  const openZerodhaLogin = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/zerodha/login-url`);
+      const data = await res.json();
+      if (data.success && data.login_url) {
+        window.open(data.login_url, '_blank', 'noopener,noreferrer');
+        setZerodhaAuthResult(null);
+      } else {
+        setZerodhaAuthResult({ success: false, error: data.error || 'Could not generate login URL. Check API key is saved.' });
+      }
+    } catch (err) {
+      setZerodhaAuthResult({ success: false, error: err.message });
+    }
+  };
+
 
   // Update Gemini key
   const updateGeminiKey = async () => {
@@ -699,8 +719,9 @@ function App() {
               </div>
 
               {/* Zerodha API */}
-              <div className="bg-gray-700/50 rounded-lg p-4">
-                <div className="flex items-center justify-between mb-3">
+              <div className="bg-gray-700/50 rounded-lg p-4 space-y-4">
+                {/* Header */}
+                <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="font-medium">Zerodha Kite API</span>
                     {credentials?.zerodha?.configured ? (
@@ -711,8 +732,10 @@ function App() {
                   </div>
                   <span className="text-sm text-gray-400 font-mono">{credentials?.zerodha?.api_key_masked}</span>
                 </div>
-                
-                <div className="space-y-2 mb-3">
+
+                {/* API Key + Secret save */}
+                <div className="space-y-2">
+                  <p className="text-xs text-gray-400 font-medium uppercase tracking-wide">API Credentials</p>
                   <div className="flex gap-2">
                     <div className="flex-1 relative">
                       <input
@@ -722,7 +745,7 @@ function App() {
                         placeholder="API Key"
                         className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white pr-10"
                       />
-                      <button 
+                      <button
                         onClick={() => setShowZerodhaKey(!showZerodhaKey)}
                         className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
                       >
@@ -735,37 +758,75 @@ function App() {
                       type="password"
                       value={zerodhaSecret}
                       onChange={(e) => setZerodhaSecret(e.target.value)}
-                      placeholder="API Secret (optional)"
+                      placeholder="API Secret"
                       className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white"
                     />
-                    <button 
+                    <button
                       onClick={updateZerodhaCredentials}
                       disabled={!zerodhaKey.trim()}
-                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg"
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg text-sm"
                     >
                       Save
                     </button>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <button 
-                    onClick={testZerodha}
-                    disabled={testingZerodha}
-                    className="flex items-center gap-2 px-3 py-1.5 bg-gray-600 hover:bg-gray-500 rounded-lg text-sm"
-                  >
-                    {testingZerodha ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                    Test Connection
-                  </button>
-                  {zerodhaTestResult && (
-                    <span className={`text-sm ${zerodhaTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
-                      {zerodhaTestResult.success ? '✓ ' + zerodhaTestResult.message : '✗ ' + zerodhaTestResult.error}
-                    </span>
-                  )}
+                {/* Daily re-auth flow */}
+                <div className="border-t border-gray-600 pt-3 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-gray-400 font-medium uppercase tracking-wide">Daily Authentication</p>
+                    <span className="text-xs text-gray-500">Access tokens expire every day</span>
+                  </div>
+
+                  {/* Step 1 */}
+                  <div className="flex items-start gap-3">
+                    <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">1</span>
+                    <div className="flex-1">
+                      <p className="text-sm text-gray-300 mb-1">Open Zerodha login — a browser tab will open</p>
+                      <button
+                        onClick={openZerodhaLogin}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-orange-600 hover:bg-orange-500 rounded-lg text-sm font-medium text-white transition"
+                      >
+                        <Key className="w-3.5 h-3.5" />
+                        Open Zerodha Login
+                      </button>
+                      {zerodhaAuthResult && !zerodhaAuthResult.success && (
+                        <p className="text-xs text-red-400 mt-1">{zerodhaAuthResult.error}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Step 2 */}
+                  <div className="flex items-start gap-3">
+                    <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">2</span>
+                    <div className="flex-1">
+                      <p className="text-sm text-gray-300 mb-1">Log in with your Zerodha credentials</p>
+                      <p className="text-xs text-gray-500">After login, Zerodha redirects back to Sentinel which saves the token automatically. You'll see a confirmation page — close that tab and come back here.</p>
+                    </div>
+                  </div>
+
+                  {/* Step 3 */}
+                  <div className="flex items-start gap-3">
+                    <span className="shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-xs flex items-center justify-center mt-0.5 font-bold">3</span>
+                    <div className="flex-1">
+                      <p className="text-sm text-gray-300 mb-1">Verify the connection</p>
+                      <button
+                        onClick={testZerodha}
+                        disabled={testingZerodha}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 rounded-lg text-sm font-medium text-white transition"
+                      >
+                        {testingZerodha ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle className="w-3.5 h-3.5" />}
+                        {testingZerodha ? 'Checking…' : 'Verify Connection'}
+                      </button>
+                      {zerodhaTestResult && (
+                        <p className={`text-sm mt-1 ${zerodhaTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
+                          {zerodhaTestResult.success ? '✓ ' + zerodhaTestResult.message : '✗ ' + zerodhaTestResult.error}
+                        </p>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                <p className="text-xs text-gray-500 mt-2">
-                  Note: Paper trading uses MockKite. Real trading requires Zerodha credentials.
-                </p>
+
               </div>
             </div>
           </div>
@@ -819,7 +880,15 @@ function App() {
             </span>
           )}
         </button>
-        
+        <button
+          onClick={() => setActiveView('holdings')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${
+            activeView === 'holdings' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
+          }`}
+        >
+          <Wallet className="w-4 h-4" /> Holdings
+        </button>
+
         {/* Trading Phase Badge */}
         {tradingPhase && (
           <div className={`ml-4 px-3 py-1 rounded-full text-xs font-medium ${
@@ -836,18 +905,43 @@ function App() {
 
       {/* Conditional Views */}
       {activeView === 'heatmap' && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
-            <TechnicalHeatmap 
-              onSelectTicker={(ticker) => {
-                setSelectedTicker(ticker);
-                setActiveView('chart');
-              }}
-              activeTicker={selectedTicker}
-            />
-          </div>
-          <div>
-            <AIReasoningPanel ticker={selectedTicker} />
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Heatmap always visible */}
+            <div className={selectedTicker ? 'lg:col-span-2' : 'lg:col-span-3'}>
+              <TechnicalHeatmap
+                onSelectTicker={(ticker) => setSelectedTicker(ticker)}
+                activeTicker={selectedTicker}
+              />
+            </div>
+
+            {/* Inline chart + AI panel — shown when a stock is selected */}
+            {selectedTicker && (
+              <div className="space-y-4">
+                {/* Selected stock header */}
+                <div className="flex items-center justify-between">
+                  <h3 className="font-semibold text-white flex items-center gap-2">
+                    <CandlestickChart className="w-4 h-4 text-blue-400" />
+                    {selectedTicker}
+                  </h3>
+                  <button
+                    onClick={() => setSelectedTicker(null)}
+                    className="text-gray-500 hover:text-white text-xs px-2 py-1 rounded hover:bg-gray-700"
+                  >
+                    ✕ Close
+                  </button>
+                </div>
+                <TradingChart
+                  ticker={selectedTicker}
+                  candles={chartData.candles || []}
+                  indicators={chartData.indicators || {}}
+                  position={positions.find(p => p.ticker === selectedTicker)}
+                  trades={trades.filter(t => t.ticker === selectedTicker)}
+                  height={280}
+                />
+                <AIReasoningPanel ticker={selectedTicker} />
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -899,6 +993,10 @@ function App() {
           watchlist={status?.watchlist || []}
           onAdd={addToWatchlistByTicker}
         />
+      )}
+
+      {activeView === 'holdings' && (
+        <Holdings tradingMode={tradingMode} />
       )}
 
       {activeView === 'dashboard' && (
