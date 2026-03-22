@@ -1004,6 +1004,84 @@ async def get_trades(limit: int = 50):
     return {"trades": trades_list, "count": len(trades_list)}
 
 
+@app.get("/api/pnl-history")
+async def get_pnl_history(days: int = 30):
+    """
+    Return daily PnL, cumulative equity curve, and max drawdown data.
+
+    Response shape:
+    {
+      "daily": [{"date": "2026-03-21", "pnl": 1200.0, "trades": 4, "win_rate": 75.0}],
+      "equity": [{"date": "...", "equity": 101200.0}],
+      "max_drawdown": 3.5,       # percentage
+      "total_pnl": 4500.0,
+      "starting_capital": 100000.0
+    }
+    """
+    try:
+        db = engine.db
+        # Fetch all closed trades within the window
+        cutoff = datetime.now() - timedelta(days=days)
+        query = """
+            SELECT
+                CAST(exit_time AS DATE) AS trade_date,
+                SUM(pnl)               AS daily_pnl,
+                COUNT(*)               AS num_trades,
+                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins
+            FROM trades
+            WHERE status = 'CLOSED'
+              AND exit_time >= ?
+            GROUP BY trade_date
+            ORDER BY trade_date ASC
+        """
+        try:
+            df = db.conn.execute(query, [cutoff]).df()
+        except Exception:
+            return {"daily": [], "equity": [], "max_drawdown": 0.0,
+                    "total_pnl": 0.0, "starting_capital": 100000.0}
+
+        if df.empty:
+            return {"daily": [], "equity": [], "max_drawdown": 0.0,
+                    "total_pnl": 0.0, "starting_capital": 100000.0}
+
+        from config.settings import STARTING_CAPITAL as BASE_CAP
+        capital = BASE_CAP
+        peak = capital
+        max_dd = 0.0
+        daily_rows = []
+        equity_rows = []
+
+        for _, row in df.iterrows():
+            date_str = str(row['trade_date'])
+            pnl = float(row['daily_pnl'])
+            n = int(row['num_trades'])
+            wins = int(row['wins'])
+            capital += pnl
+            peak = max(peak, capital)
+            drawdown = (peak - capital) / peak * 100 if peak > 0 else 0.0
+            max_dd = max(max_dd, drawdown)
+            daily_rows.append({
+                "date": date_str,
+                "pnl": round(pnl, 2),
+                "trades": n,
+                "win_rate": round(wins / n * 100, 1) if n > 0 else 0.0,
+            })
+            equity_rows.append({"date": date_str, "equity": round(capital, 2)})
+
+        total_pnl = capital - BASE_CAP
+        return {
+            "daily": daily_rows,
+            "equity": equity_rows,
+            "max_drawdown": round(max_dd, 2),
+            "total_pnl": round(total_pnl, 2),
+            "starting_capital": BASE_CAP,
+        }
+    except Exception as e:
+        logger.error(f"pnl-history error: {e}")
+        return {"daily": [], "equity": [], "max_drawdown": 0.0,
+                "total_pnl": 0.0, "starting_capital": 100000.0}
+
+
 @app.get("/api/candles/{ticker}")
 async def get_candles(ticker: str, limit: int = 100):
     """Get candle data for a ticker."""

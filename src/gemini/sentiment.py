@@ -39,7 +39,62 @@ class SentimentAnalyzer:
     Analyzes news sentiment using Gemini 2.5 Flash.
     Uses google-genai SDK with Pydantic structured outputs.
     """
-    
+
+    # One-line business description per ticker so Gemini can reason about
+    # sector-level or sparse news in company-specific terms.
+    TICKER_CONTEXT: dict = {
+        "RELIANCE":   "Reliance Industries — India's largest conglomerate; O2C refining/petrochemicals, Jio telecom, Reliance Retail, and green energy.",
+        "TCS":        "Tata Consultancy Services — India's largest IT services firm; major clients in global banking, retail, and manufacturing.",
+        "HDFCBANK":   "HDFC Bank — India's largest private bank by assets; high CASA ~42%, strong retail and corporate banking franchise.",
+        "ICICIBANK":  "ICICI Bank — Large private sector bank; diversified across retail, SME, and corporate loans; digital-first strategy.",
+        "INFY":       "Infosys — Tier-1 IT services company; focuses on digital transformation, cloud, and AI for global enterprises.",
+        "HINDUNILVR": "Hindustan Unilever — Leading FMCG; dominant in home care, personal care, and foods; high rural India exposure.",
+        "SBIN":       "State Bank of India — India's largest public sector bank; significant government borrowings and rural credit exposure.",
+        "BHARTIARTL": "Bharti Airtel — India's 2nd-largest telecom; strong 5G rollout, Africa operations, and enterprise data business.",
+        "KOTAKBANK":  "Kotak Mahindra Bank — Premium private bank; conservative credit culture, high capital adequacy, wealth management arm.",
+        "ITC":        "ITC Limited — Diversified conglomerate; cigarettes (cash cow), FMCG foods, agribusiness, hotels, and paperboards.",
+        "LT":         "Larsen & Toubro — India's largest EPC and construction company; strong order book in infra, defence, and hydrocarbons.",
+        "AXISBANK":   "Axis Bank — Mid-large private bank; growing retail franchise, improving asset quality post-2020 clean-up.",
+        "ASIANPAINT": "Asian Paints — India's largest decorative paints company; pricing power, strong distribution, expanding home décor.",
+        "MARUTI":     "Maruti Suzuki — India's largest passenger car maker by volume; dominant in small/mid segment, SUV ramp-up underway.",
+        "SUNPHARMA":  "Sun Pharma — India's largest pharma; strong US generics, branded India business, and specialty drugs pipeline.",
+        "TITAN":      "Titan Company — Premium consumer brand; jewellery (Tanishq), watches, eyewear, and emerging segments.",
+        "ULTRACEMCO": "UltraTech Cement — India's largest cement maker; capacity expansion, strong pricing discipline, pan-India footprint.",
+        "BAJFINANCE": "Bajaj Finance — India's leading consumer and SME NBFC; aggressive loan book growth and digital lending platform.",
+        "WIPRO":      "Wipro — Tier-1 IT services; focus on consulting, cloud, and cyber-security; margin recovery underway.",
+        "HCLTECH":    "HCL Technologies — Tier-1 IT; strong in infrastructure services, engineering R&D, and software products (HCL Software).",
+        "ONGC":       "ONGC — State-owned upstream oil & gas; dominates domestic crude and gas production; exposed to oil price cycles.",
+        "NTPC":       "NTPC — India's largest power generator; coal-based thermal fleet transitioning to renewables (solar, wind, hydro).",
+        "POWERGRID":  "Power Grid Corp — Regulated electricity transmission utility; stable fee income, minimal volume risk.",
+        "TATASTEEL":  "Tata Steel — Integrated global steel producer; India operations highly profitable, UK (Port Talbot) in restructuring.",
+        "JSWSTEEL":   "JSW Steel — India's largest private steel producer; aggressive capacity expansion, exposed to global steel prices.",
+        "ADANIENT":   "Adani Enterprises — Adani Group flagship; incubator for new businesses including green hydrogen, airports, data centres.",
+        "ADANIPORTS": "Adani Ports — India's largest private port operator; handles ~27% of India's seaborne cargo, logistics play.",
+        "BAJAJ-AUTO": "Bajaj Auto — Top two/three-wheeler maker; strong exports (Africa, ASEAN), premium motorcycles, EV transition.",
+        "BAJAJFINSV": "Bajaj Finserv — Holding company for Bajaj Finance (NBFC) and Bajaj Allianz insurance arms.",
+        "BPCL":       "BPCL — State PSU oil marketer; fuel retail, refining, and upstream exploration; government disinvestment candidate.",
+        "BRITANNIA":  "Britannia Industries — Leading biscuits and dairy brand; margin leverage from wheat/dairy costs, strong distribution.",
+        "CIPLA":      "Cipla — Pharma; strong India branded generics, growing US inhalers business, and emerging biosimilars.",
+        "COALINDIA":  "Coal India — State-owned coal miner; dominant domestic supplier; high dividend yield, exposed to thermal power demand.",
+        "DIVISLAB":   "Divi's Laboratories — API and CRAMS manufacturer; high-margin custom synthesis, key global pharma supply chain partner.",
+        "DRREDDY":    "Dr. Reddy's — Pharma; large US generics, branded India/CIS markets, biosimilars, and branded trade generics.",
+        "EICHERMOT":  "Eicher Motors — Royal Enfield premium motorcycle brand + VECV (trucks JV with Volvo); high-margin niche.",
+        "GRASIM":     "Grasim — Aditya Birla Group; viscose staple fibre, chemicals, and building products; holds 56% of UltraTech.",
+        "HDFCLIFE":   "HDFC Life — Private life insurer; strong bancassurance distribution through HDFC Bank, diversified product mix.",
+        "HEROMOTOCO": "Hero MotoCorp — India's largest 2-wheeler by volume; mass market commuter segment, rural penetration play.",
+        "HINDALCO":   "Hindalco — Aluminium and copper; Novelis (rolled aluminium products globally) is a key value driver.",
+        "INDUSINDBK": "IndusInd Bank — Mid-sized private bank; commercial vehicle finance, microfinance, and strong fee income.",
+        "M&M":        "Mahindra & Mahindra — SUVs, tractors, and EV (BE series); strong rural and semi-urban demand.",
+        "NESTLEIND":  "Nestlé India — FMCG; Maggi noodles, KitKat, Munch, and dairy; premium margins, limited rural reach.",
+        "SBILIFE":    "SBI Life Insurance — Largest private life insurer; leverages SBI's vast branch network for distribution.",
+        "SHREECEM":   "Shree Cement — High-efficiency cement maker; lowest cost structure in industry, premium to peers justified.",
+        "TATACONSUM": "Tata Consumer Products — Beverages (Tata Tea, Tetley), foods (Tata Salt, Soulfull); growth via acquisitions.",
+        "TATAMOTORS": "Tata Motors — Passenger vehicles (India + JLR luxury); EV ramp in India, JLR profitability recovery.",
+        "TECHM":      "Tech Mahindra — IT services with telecom vertical focus; turnaround under new CEO, margin recovery expected.",
+        "APOLLOHOSP": "Apollo Hospitals — India's largest private hospital chain; high-acuity care, Apollo 24|7 digital health, pharmacy.",
+        "UPL":        "UPL — Global agrochemicals; post-Arysta acquisition leverage concerns, focus on debt reduction and margin recovery.",
+    }
+
     SYSTEM_INSTRUCTION = """You are a financial sentiment analyst for Indian stock markets.
 Your role is to analyze news headlines and assess market sentiment for trading decisions.
 
@@ -122,12 +177,16 @@ Scoring Guide:
         
         # Prepare headlines (numbered for clarity)
         headlines_text = "\n".join([f"{i+1}. {h}" for i, h in enumerate(headlines[:10])])
-        
+        company_context = self.TICKER_CONTEXT.get(ticker, f"{ticker} — Indian listed stock on NSE.")
+
         prompt = f"""Analyze the following news headlines for {ticker} and provide a sentiment assessment.
+
+COMPANY: {company_context}
 
 HEADLINES:
 {headlines_text}
 
+Consider how each headline specifically affects {ticker}'s business model and financials.
 Provide your analysis."""
         
         # Make request with retries using Pydantic structured output
@@ -201,11 +260,16 @@ Provide your analysis."""
             )
         
         headlines_text = "\n".join([f"{i+1}. {h}" for i, h in enumerate(headlines[:10])])
+        company_context = self.TICKER_CONTEXT.get(ticker, f"{ticker} — Indian listed stock on NSE.")
+
         prompt = f"""Analyze the following news headlines for {ticker} and provide a sentiment assessment.
+
+COMPANY: {company_context}
 
 HEADLINES:
 {headlines_text}
 
+Consider how each headline specifically affects {ticker}'s business model and financials.
 Provide your analysis."""
         
         for attempt in range(self.max_retries):

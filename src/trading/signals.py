@@ -24,6 +24,7 @@ import logging
 from src.signals.indicators import TechnicalIndicators
 from config.settings import (
     VWAP_PULLBACK_THRESHOLD, VOLUME_CONFIRMATION_MULTIPLIER, VOLUME_OVERRIDES,
+    VWAP_OVERRIDES,
     ATR_STOP_LOSS_MULTIPLIER, ATR_TAKE_PROFIT_MULTIPLIER, ATR_PERIOD
 )
 
@@ -209,18 +210,19 @@ class ConfluentSignalEngine:
         # NEW: Mean Reversion Filter Logic (replaces lagging RSI>60)
         # =====================================================================
         
-        # Get volume threshold for this ticker (per-stock override or global default)
+        # Get per-ticker thresholds (overrides or global defaults)
         volume_threshold = VOLUME_OVERRIDES.get(ticker, self.volume_multiplier)
-        
+        vwap_threshold = VWAP_OVERRIDES.get(ticker, self.vwap_pullback_threshold)
+
         # VWAP Pullback Detection: Price within threshold% of VWAP
         vwap_distance_pct = abs(current_price - current_vwap) / current_vwap if current_vwap > 0 else 1.0
         vwap_pullback_long = (
             current_price > current_vwap and  # Price still above VWAP
-            vwap_distance_pct <= self.vwap_pullback_threshold  # But within pullback zone
+            vwap_distance_pct <= vwap_threshold  # But within pullback zone
         )
         vwap_pullback_short = (
             current_price < current_vwap and  # Price still below VWAP
-            vwap_distance_pct <= self.vwap_pullback_threshold  # But within pullback zone
+            vwap_distance_pct <= vwap_threshold  # But within pullback zone
         )
         
         # Volume Confirmation: Institutional backing
@@ -330,7 +332,7 @@ class ConfluentSignalEngine:
             if current_price <= current_vwap:
                 missing.append(f"VWAP: Price below VWAP (₹{current_price:.2f} <= ₹{current_vwap:.2f})")
             else:
-                missing.append(f"VWAP PULLBACK: Too far from VWAP ({vwap_distance_pct:.2%} > {self.vwap_pullback_threshold:.1%})")
+                missing.append(f"VWAP PULLBACK: Too far from VWAP ({vwap_distance_pct:.2%} > {vwap_threshold:.1%})")
         if not volume_confirmed:
             missing.append(f"VOLUME: {current_volume_ratio:.1f}x < {volume_threshold}x required")
         

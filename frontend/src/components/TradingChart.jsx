@@ -1,17 +1,20 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createChart, ColorType, CrosshairMode } from 'lightweight-charts';
 
-const TradingChart = ({ 
-  ticker, 
-  candles = [], 
+const TradingChart = ({
+  ticker,
+  candles = [],
   indicators = {},
   position = null,
   trades = [],
-  height = 400 
+  height = 400
 }) => {
   const chartContainerRef = useRef(null);
+  const volumeContainerRef = useRef(null);
   const chartRef = useRef(null);
+  const volumeChartRef = useRef(null);
   const candleSeriesRef = useRef(null);
+  const volumeSeriesRef = useRef(null);
   const vwapLineRef = useRef(null);
   const ema200LineRef = useRef(null);
   const ema20LineRef = useRef(null);
@@ -105,10 +108,57 @@ const TradingChart = ({
     });
     ema9LineRef.current = ema9Line;
 
+    // --- Volume histogram chart (secondary pane below main chart) ---
+    if (volumeContainerRef.current) {
+      const volChart = createChart(volumeContainerRef.current, {
+        layout: {
+          background: { type: ColorType.Solid, color: '#1a1a2e' },
+          textColor: '#d1d5db',
+        },
+        grid: {
+          vertLines: { color: '#2d2d44' },
+          horzLines: { color: '#2d2d44' },
+        },
+        rightPriceScale: {
+          borderColor: '#2d2d44',
+          scaleMargins: { top: 0.1, bottom: 0.0 },
+        },
+        timeScale: {
+          borderColor: '#2d2d44',
+          timeVisible: true,
+          secondsVisible: false,
+        },
+        crosshair: { mode: CrosshairMode.Normal },
+        width: volumeContainerRef.current.clientWidth,
+        height: 100,
+        handleScroll: false,
+        handleScale: false,
+      });
+      volumeChartRef.current = volChart;
+
+      const volSeries = volChart.addHistogramSeries({
+        color: '#4361ee',
+        priceFormat: { type: 'volume' },
+        priceScaleId: '',
+      });
+      volumeSeriesRef.current = volSeries;
+    }
+
+    // Keep both charts' time scales in sync
+    const syncHandler = (range) => {
+      if (range && volumeChartRef.current) {
+        volumeChartRef.current.timeScale().setVisibleLogicalRange(range);
+      }
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(syncHandler);
+
     // Handle resize
     const handleResize = () => {
       if (chartContainerRef.current) {
         chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+      }
+      if (volumeContainerRef.current && volumeChartRef.current) {
+        volumeChartRef.current.applyOptions({ width: volumeContainerRef.current.clientWidth });
       }
     };
     window.addEventListener('resize', handleResize);
@@ -117,7 +167,13 @@ const TradingChart = ({
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(syncHandler);
       chart.remove();
+      if (volumeChartRef.current) {
+        volumeChartRef.current.remove();
+        volumeChartRef.current = null;
+      }
+      volumeSeriesRef.current = null;
     };
   }, [height]);
 
@@ -142,6 +198,26 @@ const TradingChart = ({
 
     candleSeriesRef.current.setData(uniqueCandles);
     chartRef.current?.timeScale().fitContent();
+  }, [candles]);
+
+  // Update volume histogram
+  useEffect(() => {
+    if (!volumeSeriesRef.current || candles.length === 0) return;
+
+    const volumeData = candles
+      .filter(c => c.volume != null && !isNaN(c.volume))
+      .map(c => {
+        const t = c.time || (typeof c.timestamp === 'string'
+          ? Math.floor(new Date(c.timestamp).getTime() / 1000)
+          : c.timestamp);
+        const isUp = (c.close ?? 0) >= (c.open ?? 0);
+        return { time: t, value: c.volume, color: isUp ? '#00f5d466' : '#ff6b6b66' };
+      })
+      .sort((a, b) => a.time - b.time)
+      .filter((v, i, arr) => i === 0 || v.time !== arr[i - 1].time);
+
+    volumeSeriesRef.current.setData(volumeData);
+    volumeChartRef.current?.timeScale().fitContent();
   }, [candles]);
 
   // Update VWAP
@@ -293,11 +369,12 @@ const TradingChart = ({
         </h3>
         
         {/* Legend */}
-        <div className="flex gap-4 text-xs">
+        <div className="flex gap-4 text-xs flex-wrap">
           <LegendItem color="#4361ee" label="VWAP" dashed />
           <LegendItem color="#9d4edd" label="200 EMA" />
           <LegendItem color="#ff6b35" label="20 EMA" />
           <LegendItem color="#00f5d4" label="9 EMA" dotted />
+          <LegendItem color="#4361ee66" label="Vol" bar />
         </div>
       </div>
 
@@ -308,6 +385,8 @@ const TradingChart = ({
           </div>
         )}
         <div ref={chartContainerRef} />
+        {/* Volume histogram below price chart */}
+        <div ref={volumeContainerRef} className="mt-1 border-t border-slate-700" />
       </div>
 
       {/* Position Info */}
@@ -335,18 +414,22 @@ const TradingChart = ({
   );
 };
 
-const LegendItem = ({ color, label, dashed, dotted }) => (
+const LegendItem = ({ color, label, dashed, dotted, bar }) => (
   <div className="flex items-center gap-1">
-    <div 
-      className="w-4 h-0.5" 
-      style={{ 
-        backgroundColor: color,
-        borderStyle: dashed ? 'dashed' : dotted ? 'dotted' : 'solid',
-        borderWidth: dashed || dotted ? '1px 0 0 0' : '0',
-        borderColor: color,
-        height: dashed || dotted ? '0' : '2px',
-      }}
-    />
+    {bar ? (
+      <div className="w-3 h-3 rounded-sm" style={{ backgroundColor: color }} />
+    ) : (
+      <div
+        className="w-4"
+        style={{
+          backgroundColor: dashed || dotted ? 'transparent' : color,
+          borderStyle: dashed ? 'dashed' : dotted ? 'dotted' : 'solid',
+          borderWidth: dashed || dotted ? '1px 0 0 0' : '0',
+          borderColor: color,
+          height: dashed || dotted ? '0' : '2px',
+        }}
+      />
+    )}
     <span className="text-slate-400">{label}</span>
   </div>
 );

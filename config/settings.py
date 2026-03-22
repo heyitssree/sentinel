@@ -43,6 +43,9 @@ MTM_LOSS_LIMIT = float(os.getenv("MTM_LOSS_LIMIT", 5000))  # ₹5,000 kill switc
 MAX_ORDERS_PER_SECOND = 10  # SEBI 2026 compliance
 DEFAULT_QUANTITY = 10  # Shares per trade (fallback if ATR sizing unavailable)
 
+# Starting capital — used for ATR position sizing and kill switch %
+STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", 100000))
+
 # Risk per trade in INR — used by ATR-based position sizing
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 500))
 
@@ -75,6 +78,16 @@ if VOLUME_OVERRIDES_RAW:
         if ":" in item:
             ticker, mult = item.split(":")
             VOLUME_OVERRIDES[ticker.strip()] = float(mult)
+
+# Per-stock VWAP pullback threshold overrides (high-beta stocks need wider threshold)
+# Format: "RELIANCE:0.008,TCS:0.010" — defaults to VWAP_PULLBACK_THRESHOLD if not set
+VWAP_OVERRIDES_RAW = os.getenv("VWAP_OVERRIDES", "")
+VWAP_OVERRIDES: dict = {}
+if VWAP_OVERRIDES_RAW:
+    for item in VWAP_OVERRIDES_RAW.split(","):
+        if ":" in item:
+            ticker, threshold = item.split(":")
+            VWAP_OVERRIDES[ticker.strip()] = float(threshold)
 
 # =============================================================================
 # Dynamic ATR-Based Stops

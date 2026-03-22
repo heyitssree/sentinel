@@ -10,8 +10,12 @@ HYBRID KILL SWITCH:
 REGIME INTEGRATION:
 - When CHOPPY regime detected, kill switch limit reduced by 50%
 - Prevents "death by a thousand cuts" in sideways markets
+
+CONSECUTIVE LOSS BREAKER:
+- After N consecutive stop-outs, pauses trading for a cooldown period
+- Prevents over-trading during unfavourable market microstructure
 """
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta, date
 from typing import Optional, Callable, TYPE_CHECKING
 import threading
 import time
@@ -381,13 +385,133 @@ class RateLimiter:
             return len(self._timestamps)
 
 
+# NSE trading holidays for 2026 (add new years as needed)
+_NSE_HOLIDAYS: set = {
+    # 2026 NSE holidays
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 2, 19),   # Chhatrapati Shivaji Maharaj Jayanti
+    date(2026, 3, 25),   # Holi
+    date(2026, 3, 30),   # Ram Navami
+    date(2026, 4, 2),    # Mahavir Jayanti
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 8, 15),   # Independence Day
+    date(2026, 9, 2),    # Ganesh Chaturthi
+    date(2026, 10, 2),   # Gandhi Jayanti / Mahatma Gandhi
+    date(2026, 10, 20),  # Diwali Laxmi Puja
+    date(2026, 10, 21),  # Diwali Balipratipada
+    date(2026, 11, 4),   # Guru Nanak Jayanti
+    date(2026, 12, 25),  # Christmas
+    # 2025 NSE holidays (for backfill / paper trading)
+    date(2025, 2, 19),   # Chhatrapati Shivaji Maharaj Jayanti
+    date(2025, 2, 26),   # Mahashivratri
+    date(2025, 3, 14),   # Holi
+    date(2025, 3, 31),   # Id-Ul-Fitr (Ramzan Eid)
+    date(2025, 4, 10),   # Shri Ram Navami
+    date(2025, 4, 14),   # Dr. Ambedkar Jayanti
+    date(2025, 4, 18),   # Good Friday
+    date(2025, 5, 1),    # Maharashtra Day
+    date(2025, 8, 15),   # Independence Day
+    date(2025, 8, 27),   # Ganesh Chaturthi
+    date(2025, 10, 2),   # Mahatma Gandhi Jayanti / Dussehra
+    date(2025, 10, 20),  # Diwali
+    date(2025, 10, 21),  # Diwali (Laxmi Puja)
+    date(2025, 11, 5),   # Prakash Gurpurb / Guru Nanak Jayanti
+    date(2025, 12, 25),  # Christmas
+}
+
+
+class ConsecutiveLossBreaker:
+    """
+    Pauses trading after N consecutive stopped-out trades.
+
+    Rationale: repeated stop-outs indicate the market structure has shifted
+    and the strategy is out of sync. A short cooldown prevents "death by
+    a thousand cuts" without triggering the full MTM kill switch.
+    """
+
+    def __init__(self, max_consecutive: int = 3, cooldown_minutes: int = 30):
+        """
+        Args:
+            max_consecutive: Number of consecutive losses before cooldown
+            cooldown_minutes: Minutes to pause trading after threshold hit
+        """
+        self.max_consecutive = max_consecutive
+        self.cooldown_minutes = cooldown_minutes
+        self._consecutive_losses: int = 0
+        self._cooldown_until: Optional[datetime] = None
+        self._lock = threading.Lock()
+        logger.info(
+            f"ConsecutiveLossBreaker initialized: "
+            f"max={max_consecutive} losses → {cooldown_minutes}min cooldown"
+        )
+
+    def record_trade(self, pnl: float) -> bool:
+        """
+        Record a closed trade result.
+
+        Args:
+            pnl: Trade PnL (negative = loss)
+
+        Returns:
+            True if cooldown was triggered by this trade
+        """
+        with self._lock:
+            if pnl < 0:
+                self._consecutive_losses += 1
+                if self._consecutive_losses >= self.max_consecutive:
+                    self._cooldown_until = datetime.now() + timedelta(minutes=self.cooldown_minutes)
+                    logger.warning(
+                        f"ConsecutiveLossBreaker: {self._consecutive_losses} consecutive losses "
+                        f"→ cooldown until {self._cooldown_until.strftime('%H:%M:%S')}"
+                    )
+                    return True
+            else:
+                if self._consecutive_losses > 0:
+                    logger.info(f"ConsecutiveLossBreaker: win resets streak (was {self._consecutive_losses})")
+                self._consecutive_losses = 0
+            return False
+
+    def is_cooling_down(self) -> bool:
+        """True if trading should be paused due to consecutive losses."""
+        with self._lock:
+            if self._cooldown_until is None:
+                return False
+            if datetime.now() >= self._cooldown_until:
+                logger.info("ConsecutiveLossBreaker: cooldown expired, trading resumed")
+                self._cooldown_until = None
+                self._consecutive_losses = 0
+                return False
+            return True
+
+    def reset_day(self):
+        """Reset streaks at start of new trading day."""
+        with self._lock:
+            self._consecutive_losses = 0
+            self._cooldown_until = None
+
+    def get_status(self) -> dict:
+        """Return current breaker state for UI/logging."""
+        with self._lock:
+            cooling = self._cooldown_until is not None and datetime.now() < self._cooldown_until
+            return {
+                'consecutive_losses': self._consecutive_losses,
+                'max_consecutive': self.max_consecutive,
+                'cooldown_minutes': self.cooldown_minutes,
+                'cooldown_until': self._cooldown_until.isoformat() if self._cooldown_until else None,
+                'is_cooling_down': cooling,
+            }
+
+
 class MarketHoursGuard:
     """
     Ensures trading only occurs during market hours.
     Indian market hours: 9:15 AM - 3:30 PM IST
+    Also blocks trading on NSE holidays and weekends.
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  open_hour: int = 9, open_minute: int = 15,
                  close_hour: int = 15, close_minute: int = 30):
         """
@@ -418,11 +542,15 @@ class MarketHoursGuard:
             now = datetime.now()
         
         current_time = now.time()
-        
-        # Check if it's a weekend
+
+        # Check weekend
         if now.weekday() >= 5:  # Saturday = 5, Sunday = 6
             return False
-        
+
+        # Check NSE holiday
+        if now.date() in _NSE_HOLIDAYS:
+            return False
+
         return self.market_open <= current_time <= self.market_close
     
     def is_closing_time(self, buffer_minutes: int = 5) -> bool:
@@ -468,52 +596,63 @@ class MarketHoursGuard:
 class RiskManager:
     """
     Unified risk management coordinator.
-    Combines kill switch, rate limiter, and market hours guard.
+    Combines kill switch, consecutive loss breaker, rate limiter,
+    and market hours guard.
     """
-    
+
     def __init__(self, mtm_loss_limit: float = 5000.0,
                  max_orders_per_second: int = 10,
-                 on_kill_switch: Callable = None):
+                 on_kill_switch: Callable = None,
+                 max_consecutive_losses: int = 3,
+                 cooldown_minutes: int = 30):
         """
         Initialize the risk manager.
-        
+
         Args:
             mtm_loss_limit: MTM loss limit for kill switch
             max_orders_per_second: Rate limit
             on_kill_switch: Callback when kill switch triggers
+            max_consecutive_losses: Losses in a row before cooldown
+            cooldown_minutes: Minutes to pause after consecutive losses
         """
         self.kill_switch = KillSwitch(mtm_loss_limit, on_kill_switch)
+        self.loss_breaker = ConsecutiveLossBreaker(max_consecutive_losses, cooldown_minutes)
         self.rate_limiter = RateLimiter(max_orders_per_second)
         self.market_hours = MarketHoursGuard()
-        
+
         self._is_active = True
-    
+
     def can_trade(self, mtm_loss: float = 0.0) -> tuple:
         """
         Check if trading is allowed.
-        
+
         Args:
             mtm_loss: Current MTM loss
-            
+
         Returns:
             Tuple of (can_trade, reason)
         """
         # Check kill switch
         if self.kill_switch.is_triggered:
             return False, "Kill switch triggered"
-        
+
         # Check MTM
         if not self.kill_switch.check(mtm_loss):
             return False, f"MTM loss exceeded: ₹{mtm_loss:.2f}"
-        
+
+        # Check consecutive loss cooldown
+        if self.loss_breaker.is_cooling_down():
+            status = self.loss_breaker.get_status()
+            return False, f"Consecutive loss cooldown (until {status['cooldown_until']})"
+
         # Check market hours
         if not self.market_hours.is_market_open():
             return False, "Market is closed"
-        
+
         # Check rate limit
         if not self.rate_limiter.can_place_order():
             return False, "Rate limit reached"
-        
+
         return True, "OK"
     
     def pre_order_check(self, mtm_loss: float = 0.0) -> bool:

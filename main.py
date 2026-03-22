@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple
+import pandas as pd
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -22,13 +23,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config.settings import (
     GEMINI_API_KEY, WATCHLIST, DATABASE_PATH,
     MTM_LOSS_LIMIT, SLIPPAGE_PCT, DEFAULT_QUANTITY,
-    CANDLE_INTERVAL_SECONDS, LOG_LEVEL, LOG_FORMAT
+    CANDLE_INTERVAL_SECONDS, LOG_LEVEL, LOG_FORMAT,
+    STARTING_CAPITAL, RISK_PER_TRADE, ATR_STOP_LOSS_MULTIPLIER,
 )
 from src.storage.db import SentinelDB, get_db
 from src.ingestion.mock_kite import MockKite, MockTicker
 from src.ingestion.news_scraper import NewsScraper, MockNewsScraper
 from src.signals.indicators import TechnicalIndicators
-from src.trading.signals import ConfluentSignalEngine, SmartTrailingStop
+from src.trading.signals import ConfluentSignalEngine, SmartTrailingStop, calculate_atr_position_size
 from src.gemini.regime_detector import RegimeDetector, MockRegimeDetector
 from src.charts.generator import ChartGenerator
 from src.gemini.sentiment import SentimentAnalyzer, MockSentimentAnalyzer
@@ -268,107 +270,152 @@ class Sentinel:
         except Exception as e:
             logger.warning(f"News fetch failed for {ticker}: {e}")
     
+    @staticmethod
+    def _resample_to_hourly(df: pd.DataFrame) -> pd.DataFrame:
+        """Aggregate 5-min candles into 1-hour candles for MTF analysis."""
+        if df.empty or 'timestamp' not in df.columns:
+            return pd.DataFrame()
+        df = df.copy()
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        hourly = (
+            df.set_index('timestamp')
+            .resample('1h')
+            .agg(open=('open', 'first'), high=('high', 'max'),
+                 low=('low', 'min'), close=('close', 'last'),
+                 volume=('volume', 'sum'))
+            .dropna(subset=['open'])
+            .reset_index()
+        )
+        return hourly
+
     def _analyze_ticker(self, ticker: str) -> bool:
         """
         Run full analysis pipeline for a ticker.
-        
+
+        Changes vs original:
+        - Fetches 600 5-min candles so we can build a meaningful 1-hour dataset
+        - Uses check_confluence_with_mtf() for higher-timeframe confirmation
+        - ATR-based position sizing replaces the static DEFAULT_QUANTITY
+        - Consecutive-loss results are recorded with the loss breaker
+
         Returns:
             True if a trade was executed
         """
-        # Get candle data
-        candles = self.db.get_candles(ticker, limit=50)
-        if candles.empty or len(candles) < 20:
-            logger.debug(f"Insufficient data for {ticker}: {len(candles)} candles")
+        # Fetch enough candles for both the 5-min entry check and 1-hour MTF filter.
+        # 600 × 5min = 50 hours ≈ 50 × 1-hour bars (enough for trend context).
+        candles_all = self.db.get_candles(ticker, limit=600)
+        if candles_all.empty or len(candles_all) < 20:
+            logger.debug(f"Insufficient data for {ticker}: {len(candles_all)} candles")
             return False
-        
-        # Check if already in position
+
+        # Keep last 50 for the 5-min entry logic (same as before)
+        candles = candles_all.tail(50).reset_index(drop=True)
+
+        # Check if already in position — record any SL/TP exits for loss breaker
         if self.executor.has_position(ticker):
-            # Check stop loss / take profit
-            self.executor.check_stop_loss_take_profit()
+            closed_trades = self.executor.check_stop_loss_take_profit()
+            for exit_trade in closed_trades:
+                self.risk_manager.loss_breaker.record_trade(exit_trade.pnl)
             return False
-        
-        # Run signal analysis with new ConfluentSignalEngine
-        should_audit, analysis = self.signal_engine.should_trigger_audit(candles, ticker)
-        
-        if not should_audit:
+
+        # --- Multi-Timeframe Confluence Check ---
+        candles_1h = self._resample_to_hourly(candles_all)
+        analysis = self.signal_engine.check_confluence_with_mtf(candles, candles_1h, ticker)
+
+        if not analysis.is_valid:
             logger.debug(f"{ticker}: No signal | {analysis.reason}")
             return False
-        
+
         # Determine trade side from signal type
         side = "BUY" if analysis.signal_type.name == "LONG_ENTRY" else "SELL"
-        
-        logger.info(f"🔔 {ticker}: {side} Signal detected! Running Gemini audit...")
-        
-        # Feature A: Sentiment Analysis
+
+        logger.info(f"🔔 {ticker}: {side} Signal (conf={analysis.confidence:.0%}) | {analysis.reason}")
+
+        # --- Sentiment Analysis ---
         headlines = self.db.get_recent_news(ticker, limit=10)
         headline_list = headlines['headline'].tolist() if not headlines.empty else []
-        
+
         proceed_sentiment, sentiment_result = self.sentiment.should_proceed_with_trade(
             ticker, headline_list
         )
-        
+
         if not proceed_sentiment:
             logger.info(f"❌ {ticker}: Blocked by sentiment ({sentiment_result.score:.2f})")
             return False
-        
+
         logger.info(f"✅ {ticker}: Sentiment OK ({sentiment_result.score:.2f})")
-        
-        # Feature B: Visual Analysis
-        # Generate chart
+
+        # --- Visual Audit ---
         vwap = self.indicators.calculate_vwap(candles)
         ema = self.indicators.calculate_ema(candles, 20)
         rsi = self.indicators.calculate_rsi(candles, 14)
-        
+
         chart_path = self.chart_gen.generate_chart(
             candles, ticker, vwap=vwap, ema=ema, rsi=rsi
         )
-        
+
         is_safe, vision_result = self.vision.is_safe_to_enter(ticker, chart_path)
-        
+
         if not is_safe:
             logger.info(f"❌ {ticker}: Blocked by visual audit ({vision_result.safety})")
             return False
-        
+
         logger.info(f"✅ {ticker}: Visual audit SAFE ({vision_result.pattern_detected})")
-        
-        # Execute trade
+
+        # --- Pre-order risk checks (includes loss-breaker cooldown) ---
         if not self.risk_manager.pre_order_check(self.executor.get_mtm_pnl()):
-            logger.warning(f"Trade blocked by risk manager")
+            logger.warning(f"Trade blocked by risk manager for {ticker}")
             return False
-        
-        # Calculate dynamic ATR-based stops
+
+        # --- ATR-based position sizing (replaces static DEFAULT_QUANTITY) ---
         atr = self.indicators.calculate_atr(candles, 14)
-        latest_atr = atr.iloc[-1] if not atr.empty else candles['close'].iloc[-1] * 0.02
+        latest_atr = float(atr.iloc[-1]) if not atr.empty and not pd.isna(atr.iloc[-1]) \
+            else candles['close'].iloc[-1] * 0.02
+
+        quantity = calculate_atr_position_size(
+            total_capital=STARTING_CAPITAL,
+            risk_per_trade=RISK_PER_TRADE,
+            atr=latest_atr,
+            atr_multiplier=ATR_STOP_LOSS_MULTIPLIER,
+            price=candles['close'].iloc[-1],
+        )
+        # Fallback to default if sizing returns unreasonable result
+        if quantity <= 0:
+            quantity = DEFAULT_QUANTITY
+
+        # --- Dynamic ATR stops ---
         entry_price = candles['close'].iloc[-1]
         stop_loss, take_profit = self.signal_engine.calculate_dynamic_stops(
             entry_price=entry_price, atr=latest_atr, side=side
         )
-        
+
         trade = self.executor.execute_entry(
             ticker=ticker,
             side=side,
+            quantity=quantity,
             reason=analysis.reason,
             sentiment_score=sentiment_result.score,
             chart_safety=vision_result.safety,
             stop_loss=stop_loss,
-            take_profit=take_profit
+            take_profit=take_profit,
         )
-        
+
         if trade:
             self.risk_manager.post_order_record()
-            # Register position with smart trailing stop manager
             self.trailing_stop.register_position(
                 ticker=ticker,
                 entry_price=trade.entry_price,
                 entry_time=trade.entry_time,
                 quantity=trade.quantity,
                 side=trade.side,
-                atr=latest_atr
+                atr=latest_atr,
             )
-            logger.info(f"🚀 TRADE EXECUTED: {side} {ticker} @ ₹{trade.entry_price:.2f}")
-            logger.info(f"   SL: ₹{stop_loss:.2f} | TP: ₹{take_profit:.2f}")
+            logger.info(
+                f"🚀 TRADE EXECUTED: {side} {quantity}×{ticker} @ ₹{trade.entry_price:.2f} "
+                f"| SL: ₹{stop_loss:.2f} | TP: ₹{take_profit:.2f}"
+            )
             return True
-        
+
         return False
     
     def _process_tickers_parallel(self, tickers: List[str]) -> List[Tuple[str, bool, any]]:

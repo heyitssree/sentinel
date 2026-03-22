@@ -21,28 +21,35 @@ class TechnicalIndicators:
     def calculate_vwap(df: pd.DataFrame) -> pd.Series:
         """
         Calculate Volume Weighted Average Price (VWAP).
-        VWAP resets at the start of each trading day.
-        
+        VWAP resets at the start of each trading session (each unique date).
+        This prevents VWAP contamination from prior-day candles.
+
         Args:
-            df: DataFrame with 'high', 'low', 'close', 'volume' columns
-            
+            df: DataFrame with 'high', 'low', 'close', 'volume', 'timestamp' columns
+
         Returns:
-            Series with VWAP values
+            Series with VWAP values, reset per trading day
         """
         if df.empty:
             return pd.Series(dtype=float)
-        
-        # Typical price = (High + Low + Close) / 3
+
+        # Session-aware VWAP: group by date and reset cumsum each day
+        if 'timestamp' in df.columns:
+            dates = pd.to_datetime(df['timestamp']).dt.date
+            result = pd.Series(np.nan, index=df.index, dtype=float)
+            for _, grp in df.groupby(dates, sort=False):
+                tp = (grp['high'] + grp['low'] + grp['close']) / 3
+                cum_vol = grp['volume'].cumsum()
+                cum_tpv = (tp * grp['volume']).cumsum()
+                # Use .values to avoid index-alignment issues when writing back
+                result.loc[grp.index] = (cum_tpv / cum_vol).values
+            return result.replace([np.inf, -np.inf], np.nan)
+
+        # Fallback (no timestamp column): single-session cumsum
         typical_price = (df['high'] + df['low'] + df['close']) / 3
-        
-        # VWAP = Cumulative(TP * Volume) / Cumulative(Volume)
         cumulative_tp_vol = (typical_price * df['volume']).cumsum()
         cumulative_vol = df['volume'].cumsum()
-        
-        vwap = cumulative_tp_vol / cumulative_vol
-        vwap = vwap.replace([np.inf, -np.inf], np.nan)
-        
-        return vwap
+        return (cumulative_tp_vol / cumulative_vol).replace([np.inf, -np.inf], np.nan)
     
     @staticmethod
     def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:

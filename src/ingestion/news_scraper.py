@@ -75,6 +75,68 @@ class NewsScraper:
         ("Yahoo Finance India", "https://finance.yahoo.com/news/rssindex"),
     ]
     
+    # Sector-level keywords that map to all stocks in a sector.
+    # Used as a fallback: when a headline mentions a sector but no specific company,
+    # it is still distributed to relevant stocks so they get contextual news.
+    SECTOR_KEYWORDS: dict = {
+        "BANKING": {
+            "tickers": ["HDFCBANK", "ICICIBANK", "AXISBANK", "KOTAKBANK", "SBIN", "INDUSINDBK"],
+            "keywords": [
+                "bank nifty", "banking sector", "banking stocks", "private bank", "psu bank",
+                "repo rate", "rbi policy", "rbi rate", "credit growth", "net npa", "gross npa",
+                "banking index", "bank credit", "deposit growth", "net interest margin",
+            ],
+        },
+        "IT": {
+            "tickers": ["TCS", "INFY", "WIPRO", "HCLTECH", "TECHM"],
+            "keywords": [
+                "nifty it", "it sector", "software stocks", "indian it", "nasscom",
+                "it index", "tech layoffs", "it spending", "outsourcing demand",
+            ],
+        },
+        "PHARMA": {
+            "tickers": ["SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB"],
+            "keywords": [
+                "nifty pharma", "pharma sector", "pharmaceutical stocks",
+                "usfda", "us fda", "drug regulator", "cdsco", "api prices",
+            ],
+        },
+        "AUTO": {
+            "tickers": ["MARUTI", "TATAMOTORS", "BAJAJ-AUTO", "HEROMOTOCO", "EICHERMOT", "M&M"],
+            "keywords": [
+                "nifty auto", "auto sector", "automobile stocks", "auto sales",
+                "ev sales", "electric vehicle india", "two wheeler sales", "passenger vehicle",
+            ],
+        },
+        "FMCG": {
+            "tickers": ["HINDUNILVR", "ITC", "NESTLEIND", "BRITANNIA", "TATACONSUM"],
+            "keywords": [
+                "nifty fmcg", "fmcg sector", "consumer staples", "rural demand",
+                "fmcg volume growth", "fast moving consumer",
+            ],
+        },
+        "METAL": {
+            "tickers": ["TATASTEEL", "JSWSTEEL", "HINDALCO", "COALINDIA"],
+            "keywords": [
+                "nifty metal", "metal stocks", "steel sector", "iron ore prices",
+                "base metals", "steel prices", "aluminium prices",
+            ],
+        },
+        "ENERGY": {
+            "tickers": ["RELIANCE", "ONGC", "BPCL", "NTPC", "POWERGRID"],
+            "keywords": [
+                "nifty energy", "oil gas sector", "crude oil india", "power sector india",
+                "energy stocks", "oil prices india",
+            ],
+        },
+        "REALTY": {
+            "tickers": ["ADANIENT", "ADANIPORTS"],
+            "keywords": [
+                "adani group", "adani stocks", "adani index",
+            ],
+        },
+    }
+
     # Keyword mappings for stock identification
     TICKER_KEYWORDS = {
         # --- Nifty 50 complete coverage ---
@@ -163,24 +225,39 @@ class NewsScraper:
     def _extract_tickers(self, text: str) -> List[str]:
         """
         Extract stock tickers mentioned in text.
-        
+
+        First checks company-specific keywords; if none match, falls back to
+        sector-level keywords so broad sector news still reaches relevant stocks.
+
         Args:
             text: Text to search for ticker mentions
-            
+
         Returns:
-            List of matching ticker symbols
+            List of matching ticker symbols (deduplicated, preserving order)
         """
         normalized = self._normalize_text(text)
-        found_tickers = []
-        
+        found: dict = {}  # ticker -> source ('direct' | 'sector') for dedup
+
+        # 1. Company-specific keyword match (highest priority)
         for ticker, keywords in self.TICKER_KEYWORDS.items():
-            # Search ALL known tickers, not just watchlist
             for keyword in keywords:
                 if keyword in normalized:
-                    found_tickers.append(ticker)
+                    found[ticker] = 'direct'
                     break
-        
-        return found_tickers
+
+        # 2. Sector-level fallback — only if no direct match found
+        #    This ensures generic sector news reaches stocks without
+        #    flooding every ticker with every headline.
+        if not found:
+            for _sector, info in self.SECTOR_KEYWORDS.items():
+                for keyword in info["keywords"]:
+                    if keyword in normalized:
+                        for ticker in info["tickers"]:
+                            if ticker not in found:
+                                found[ticker] = 'sector'
+                        break  # matched sector — stop checking keywords for this sector
+
+        return list(found.keys())
     
     def _parse_feed(self, source_name: str, url: str) -> List[NewsItem]:
         """

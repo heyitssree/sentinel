@@ -1,11 +1,14 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { useWebSocket } from './hooks/useWebSocket';
+import { useTradingStatus } from './hooks/useTradingStatus';
+import { useCredentials } from './hooks/useCredentials';
 import {
   Shield, Activity, TrendingUp, DollarSign,
   AlertTriangle, Play, Square, Zap, BarChart3, Newspaper,
   RefreshCw, XCircle, CheckCircle, Clock, Plus, Minus,
   Wallet, Settings, RotateCcw, Key, Loader2, Eye, EyeOff,
   LayoutGrid, FileText, CandlestickChart, Sparkles, ToggleLeft, ToggleRight,
-  SlidersHorizontal
+  SlidersHorizontal, BarChart2
 } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 
@@ -15,22 +18,34 @@ import TradingChart from './components/TradingChart';
 import DailyAutopsy from './components/DailyAutopsy';
 import WatchlistSuggestions from './components/WatchlistSuggestions';
 import Holdings from './components/Holdings';
+import EquityCurve from './components/EquityCurve';
 
 const API_BASE = '/api';
 
 function App() {
-  const [status, setStatus] = useState(null);
-  const [positions, setPositions] = useState([]);
-  const [trades, setTrades] = useState([]);
+  // --- Core trading state (extracted to hook) ---
+  const { status, setStatus, positions, trades, availableStocks, loading, fetchData } =
+    useTradingStatus();
+
+  // --- Credentials state (extracted to hook) ---
+  const {
+    credentials, fetchCredentials,
+    geminiKey, setGeminiKey, showGeminiKey, setShowGeminiKey,
+    zerodhaKey, setZerodhaKey, zerodhaSecret, setZerodhaSecret,
+    showZerodhaKey, setShowZerodhaKey,
+    testingGemini, testingZerodha,
+    geminiTestResult, zerodhaTestResult, zerodhaAuthResult,
+    testGemini, testZerodha,
+    updateGeminiKey, updateZerodhaCredentials, openZerodhaLogin,
+  } = useCredentials();
+
+  // --- Local UI state ---
   const [selectedTicker, setSelectedTicker] = useState('RELIANCE');
   const [signals, setSignals] = useState({});
-  const [wsConnected, setWsConnected] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
-  const [availableStocks, setAvailableStocks] = useState([]);
   const [capitalInput, setCapitalInput] = useState('');
   const [customTicker, setCustomTicker] = useState('');
-  const [activeView, setActiveView] = useState('dashboard'); // dashboard, heatmap, chart, autopsy, suggestions, holdings
+  const [activeView, setActiveView] = useState('dashboard'); // dashboard, heatmap, chart, autopsy, suggestions, holdings, performance
   const [chartData, setChartData] = useState({ candles: [], indicators: {} });
   const [tradingPhase, setTradingPhase] = useState(null);
   const [tradingMode, setTradingMode] = useState('paper'); // "paper" | "live"
@@ -39,41 +54,7 @@ function App() {
   const [riskSettings, setRiskSettings] = useState(null);
   const [showRiskSettings, setShowRiskSettings] = useState(false);
 
-  // Credentials state
-  const [credentials, setCredentials] = useState(null);
-  const [geminiKey, setGeminiKey] = useState('');
-  const [zerodhaKey, setZerodhaKey] = useState('');
-  const [zerodhaSecret, setZerodhaSecret] = useState('');
-  const [showGeminiKey, setShowGeminiKey] = useState(false);
-  const [showZerodhaKey, setShowZerodhaKey] = useState(false);
-  const [testingGemini, setTestingGemini] = useState(false);
-  const [testingZerodha, setTestingZerodha] = useState(false);
-  const [geminiTestResult, setGeminiTestResult] = useState(null);
-  const [zerodhaTestResult, setZerodhaTestResult] = useState(null);
-  // Zerodha daily OAuth flow
-  const [zerodhaAuthResult, setZerodhaAuthResult] = useState(null); // {success, error} for login-url step
-
-  // Fetch initial data
-  const fetchData = useCallback(async () => {
-    try {
-      const [statusRes, positionsRes, tradesRes, watchlistRes] = await Promise.all([
-        fetch(`${API_BASE}/status`),
-        fetch(`${API_BASE}/positions`),
-        fetch(`${API_BASE}/trades?limit=20`),
-        fetch(`${API_BASE}/watchlist`)
-      ]);
-
-      setStatus(await statusRes.json());
-      setPositions((await positionsRes.json()).positions);
-      setTrades((await tradesRes.json()).trades);
-      const wlData = await watchlistRes.json();
-      setAvailableStocks(wlData.available || []);
-      setLoading(false);
-    } catch (error) {
-      console.error('Error fetching data:', error);
-      setLoading(false);
-    }
-  }, []);
+  // fetchData comes from useTradingStatus hook
 
   // Fetch signals for selected ticker
   const fetchSignals = useCallback(async (ticker) => {
@@ -160,98 +141,47 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // WebSocket connection with exponential backoff
-  const wsRef = useRef(null);
-  const reconnectTimeoutRef = useRef(null);
-  const reconnectAttemptRef = useRef(0);
-  const maxReconnectAttempts = 10;
-  const baseReconnectDelay = 1000;
-
-  const connectWebSocket = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-
-    // Use relative WebSocket URL — works behind any proxy/port
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = window.location.host.includes(':5173')
-      ? `${window.location.hostname}:8000`  // Vite dev server — backend on 8000
-      : window.location.host;
-
-    const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws`);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setWsConnected(true);
-      reconnectAttemptRef.current = 0;
-      console.log('WebSocket connected');
-    };
-
-    ws.onclose = (event) => {
-      setWsConnected(false);
-      wsRef.current = null;
-
-      // Don't reconnect if closed cleanly or max attempts reached
-      if (event.code === 1000 || reconnectAttemptRef.current >= maxReconnectAttempts) return;
-
-      // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s (max)
-      const delay = Math.min(baseReconnectDelay * Math.pow(2, reconnectAttemptRef.current), 32000);
-      reconnectAttemptRef.current++;
-      console.log(`WebSocket reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current})`);
-
-      reconnectTimeoutRef.current = setTimeout(connectWebSocket, delay);
-    };
-
-    ws.onerror = () => setWsConnected(false);
-
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === 'tick') {
-        setStatus(prev => ({
-          ...prev,
-          prices: data.prices,
-          stats: data.stats,
-          running: data.running,
-        }));
-      } else if (data.type === 'trade_executed') {
-        fetchData();
-        const d = data.data || {};
-        toast.success(
-          `${d.mode === 'live' ? '🔴 LIVE' : '📄 Paper'} Trade: ${d.side} ${d.quantity} ${d.ticker} @ ₹${d.price?.toFixed(2)}`,
-          { duration: 6000 }
-        );
-      } else if (data.type === 'position_closed') {
-        fetchData();
-        const d = data.data || {};
-        const pnl = d.pnl || 0;
-        if (pnl >= 0) {
-          toast.success(`✅ ${d.ticker} closed +₹${pnl.toFixed(2)} — ${d.reason || ''}`, { duration: 5000 });
-        } else {
-          toast.error(`❌ ${d.ticker} closed ₹${pnl.toFixed(2)} — ${d.reason || ''}`, { duration: 5000 });
-        }
-      } else if (data.type === 'suggestions_ready') {
-        setSuggestionsNewCount(data.count || 0);
-        toast.info(`💡 ${data.count} stock suggestions ready`, { duration: 4000 });
-      } else if (data.type === 'mode_changed') {
-        setTradingMode(data.mode);
-      } else if (data.type === 'emergency_stop') {
-        toast.error('🚨 Emergency stop triggered! All positions closed.', { duration: 10000 });
-        fetchData();
-      }
-    };
+  // WebSocket message handler (defined before hook so stable reference is passed in)
+  const handleWsMessage = useCallback((data) => {
+    if (data.type === 'tick') {
+      setStatus(prev => prev ? { ...prev, prices: data.prices, stats: data.stats, running: data.running } : prev);
+    } else if (data.type === 'trade_executed') {
+      fetchData();
+      const d = data.data || {};
+      toast.success(
+        `${d.mode === 'live' ? '🔴 LIVE' : '📄 Paper'} Trade: ${d.side} ${d.quantity} ${d.ticker} @ ₹${d.price?.toFixed(2)}`,
+        { duration: 6000 }
+      );
+    } else if (data.type === 'position_closed') {
+      fetchData();
+      const d = data.data || {};
+      const pnl = d.pnl || 0;
+      pnl >= 0
+        ? toast.success(`✅ ${d.ticker} closed +₹${pnl.toFixed(2)} — ${d.reason || ''}`, { duration: 5000 })
+        : toast.error(`❌ ${d.ticker} closed ₹${pnl.toFixed(2)} — ${d.reason || ''}`, { duration: 5000 });
+    } else if (data.type === 'suggestions_ready') {
+      setSuggestionsNewCount(data.count || 0);
+      toast.info(`💡 ${data.count} stock suggestions ready`, { duration: 4000 });
+    } else if (data.type === 'mode_changed') {
+      setTradingMode(data.mode);
+    } else if (data.type === 'emergency_stop') {
+      toast.error('🚨 Emergency stop triggered! All positions closed.', { duration: 10000 });
+      fetchData();
+    }
   }, [fetchData]);
+
+  const { wsConnected, connectWebSocket, disconnectWebSocket } = useWebSocket(handleWsMessage);
 
   useEffect(() => {
     fetchData();
     fetchTradingMode();
     connectWebSocket();
-
     const interval = setInterval(fetchData, 5000);
-
     return () => {
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (wsRef.current) wsRef.current.close(1000);
+      disconnectWebSocket();
       clearInterval(interval);
     };
-  }, [fetchData, fetchTradingMode, connectWebSocket]);
+  }, [fetchData, fetchTradingMode, connectWebSocket, disconnectWebSocket]);
 
   // Fetch signals when ticker changes
   useEffect(() => {
@@ -361,110 +291,10 @@ function App() {
     }
   };
 
-  // Fetch credentials status
-  const fetchCredentials = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/credentials/status`);
-      setCredentials(await res.json());
-    } catch (error) {
-      console.error('Error fetching credentials:', error);
-    }
-  };
-
-  // Test Gemini connection
-  const testGemini = async () => {
-    setTestingGemini(true);
-    setGeminiTestResult(null);
-    try {
-      const res = await fetch(`${API_BASE}/credentials/test/gemini`, { method: 'POST' });
-      setGeminiTestResult(await res.json());
-    } catch (error) {
-      setGeminiTestResult({ success: false, error: error.message });
-    }
-    setTestingGemini(false);
-  };
-
-  // Test Zerodha connection
-  const testZerodha = async () => {
-    setTestingZerodha(true);
-    setZerodhaTestResult(null);
-    try {
-      const res = await fetch(`${API_BASE}/credentials/test/zerodha`, { method: 'POST' });
-      setZerodhaTestResult(await res.json());
-    } catch (error) {
-      setZerodhaTestResult({ success: false, error: error.message });
-    }
-    setTestingZerodha(false);
-  };
-
-  // Zerodha daily OAuth: open login URL in new tab
-  const openZerodhaLogin = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/zerodha/login-url`);
-      const data = await res.json();
-      if (data.success && data.login_url) {
-        window.open(data.login_url, '_blank', 'noopener,noreferrer');
-        setZerodhaAuthResult(null);
-      } else {
-        setZerodhaAuthResult({ success: false, error: data.error || 'Could not generate login URL. Check API key is saved.' });
-      }
-    } catch (err) {
-      setZerodhaAuthResult({ success: false, error: err.message });
-    }
-  };
-
-
-  // Update Gemini key
-  const updateGeminiKey = async () => {
-    if (!geminiKey.trim()) return;
-    try {
-      const res = await fetch(`${API_BASE}/credentials/update`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ credential_type: 'gemini', api_key: geminiKey })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setGeminiKey('');
-        fetchCredentials();
-        toast.success('Gemini API key updated successfully');
-      }
-    } catch (error) {
-      console.error('Error updating Gemini key:', error);
-    }
-  };
-
-  // Update Zerodha credentials
-  const updateZerodhaCredentials = async () => {
-    if (!zerodhaKey.trim()) return;
-    try {
-      const res = await fetch(`${API_BASE}/credentials/update`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          credential_type: 'zerodha',
-          api_key: zerodhaKey,
-          api_secret: zerodhaSecret || undefined
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setZerodhaKey('');
-        setZerodhaSecret('');
-        fetchCredentials();
-        toast.success('Zerodha credentials updated successfully');
-      }
-    } catch (error) {
-      console.error('Error updating Zerodha credentials:', error);
-    }
-  };
-
-  // Fetch credentials when settings open
+  // Fetch credentials when settings panel opens (hook provides fetchCredentials)
   useEffect(() => {
-    if (showSettings) {
-      fetchCredentials();
-    }
-  }, [showSettings]);
+    if (showSettings) fetchCredentials();
+  }, [showSettings, fetchCredentials]);
 
   // Execute trade
   const executeTrade = async (ticker, side) => {
@@ -752,7 +582,7 @@ function App() {
                       {showGeminiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
-                  <button onClick={updateGeminiKey} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm">
+                  <button onClick={() => updateGeminiKey(toast.success)} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm">
                     Save
                   </button>
                 </div>
@@ -809,7 +639,7 @@ function App() {
                     placeholder="API Secret (optional)"
                     className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-white"
                   />
-                  <button onClick={updateZerodhaCredentials} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm">
+                  <button onClick={() => updateZerodhaCredentials(toast.success)} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm">
                     Save
                   </button>
                 </div>
@@ -932,6 +762,14 @@ function App() {
         >
           <Wallet className="w-4 h-4" /> Holdings
         </button>
+        <button
+          onClick={() => setActiveView('performance')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg transition ${
+            activeView === 'performance' ? 'bg-cyan-600 text-white' : 'text-gray-400 hover:text-white hover:bg-slate-700'
+          }`}
+        >
+          <BarChart2 className="w-4 h-4" /> Performance
+        </button>
 
         {/* Trading Phase Badge */}
         {tradingPhase && (
@@ -1041,6 +879,12 @@ function App() {
 
       {activeView === 'holdings' && (
         <Holdings tradingMode={tradingMode} />
+      )}
+
+      {activeView === 'performance' && (
+        <div className="max-w-4xl">
+          <EquityCurve days={30} />
+        </div>
       )}
 
       {activeView === 'dashboard' && (
